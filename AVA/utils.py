@@ -298,7 +298,7 @@ def tri_view_retrieval(
     
     return final_results
 
-def filter_answer_generation(results: list, llm: BaseLanguageModel, video_path: str):
+def filter_answer_generation(results: list, llm: BaseLanguageModel, video_path: str, question_id: int):
     cap = cv2.VideoCapture(video_path)
     batch_inputs = []
     for result in results:
@@ -342,13 +342,29 @@ def filter_answer_generation(results: list, llm: BaseLanguageModel, video_path: 
         tracks_json = json.dumps(tracks_json)
         batch_inputs.append({
             "video": frames,
-            "text": PROMPTS["filter_description"].format(query=result["query"], description=result["event_description"], tracks_json=tracks_json)
+            "text": PROMPTS["summary_and_answer_augmented"].format(query=result["query"], description=result["event_description"], tracks_json=tracks_json)
             # "text": PROMPTS["visual_filter_description"].format(query=result["query"], description=result["event_description"])
         })
     batch_outputs = llm.batch_generate_response(batch_inputs)
     answers = []
-    for output in batch_outputs:
-        answers.append(parse_json_response(output))
+    for output, result in zip(batch_outputs, results):
+        try:
+            answer = parse_json_response(output)
+            answer['score'] = result['score']
+            answers.append(answer)
+        except:
+            answers.append({
+                "Analysis": "No answer found",
+                "Answer": "[]",
+                "score": 0.0
+            })
+    # Save the answers to a file
+    result_path = f'database/{os.path.basename(video_path)[:-4]}/{question_id}/'
+    if not os.path.exists(result_path):
+        os.makedirs(result_path)
+    result_path = os.path.join(result_path, "answers.json")
+    with open(result_path, "w", encoding="utf-8") as f:
+        json.dump(answers, f, ensure_ascii=False, indent=2)
     return answers
 
 def parse_json_response(response: str):

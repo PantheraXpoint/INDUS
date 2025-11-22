@@ -629,5 +629,5 @@ class DynamicSampler:
         return [], [], video_info
 
 if __name__ == "__main__":
-    sampler = DynamicSampler(verbose=True)
-    segments, batches, video_info = sampler.process_video("datas/front.mp4", max_frames=150)
+    sampler = DynamicSampler(verbose=True, min_frames_per_segment=3, buffer_size=900, base_rate=0.1)
+    segments, batches, video_info = sampler.process_video("datas/front.mp4")

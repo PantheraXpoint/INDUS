@@ -28,7 +28,7 @@ class LVBench(Dataset):
             video_info["video_path"] = os.path.join(videos_path, f'{video_info["key"]}.mp4')
 
     def __len__(self):
-        return len(self.video_list)
+        return len(self.video_infos)
 
     def get_video_info(self, video_id:int):
         video_info = self.video_infos[video_id-1]
@@ -37,8 +37,16 @@ class LVBench(Dataset):
     
     def get_video(self, video_id):        
         source_path = self.video_infos[video_id-1]["video_path"]
-        work_path = os.path.join(self.work_path, f"{video_id}")
-        if not os.path.exists(work_path):
-            os.makedirs(work_path)
-        
-        return VideoRepresentation(source_path, work_path)
+        base_path = os.path.join("database", os.path.basename(source_path)[:-4])
+        if not os.path.exists(base_path):
+            os.makedirs(base_path)
+        object_faiss_db_path = os.path.join(base_path, "object_embeddings.db")
+        event_faiss_db_path = os.path.join(base_path, "event_embeddings.db")
+        object_sqlite_db_path = os.path.join(base_path, "tracked_objects.db")
+        # if not os.path.exists(object_faiss_db_path):
+        #     return None
+        # if not os.path.exists(event_faiss_db_path):
+        #     return None
+        # if not os.path.exists(object_sqlite_db_path):
+        #     return None
+        return source_path, object_faiss_db_path, event_faiss_db_path, object_sqlite_db_path

@@ -8,6 +8,9 @@ class MilvusDB:
     """
     Milvus database wrapper that dynamically infers schema fields from metadata.
     """
+    
+    # Maximum length for VARCHAR fields
+    VARCHAR_MAX_LENGTH = 8192
 
     def __init__(
         self,
@@ -68,7 +71,7 @@ class MilvusDB:
         for key, value in metadata.items():
             dtype = self._infer_field_type(value)
             if dtype == DataType.VARCHAR:
-                fields.append(FieldSchema(name=key, dtype=dtype, max_length=1024))
+                fields.append(FieldSchema(name=key, dtype=dtype, max_length=self.VARCHAR_MAX_LENGTH))
             else:
                 fields.append(FieldSchema(name=key, dtype=dtype))
 
@@ -108,7 +111,7 @@ class MilvusDB:
             for k, v in new_fields.items():
                 dtype = self._infer_field_type(v)
                 if dtype == DataType.VARCHAR:
-                    self.collection.schema.fields.append(FieldSchema(name=k, dtype=dtype, max_length=4096))
+                    self.collection.schema.fields.append(FieldSchema(name=k, dtype=dtype, max_length=self.VARCHAR_MAX_LENGTH))
                 else:
                     self.collection.schema.fields.append(FieldSchema(name=k, dtype=dtype))
             self.collection.flush()
@@ -136,6 +139,15 @@ class MilvusDB:
                 val = metadata.get(name, None)
                 if isinstance(val, (list, tuple)):
                     val = ",".join(map(str, val))
+                # Truncate string values that exceed VARCHAR max length
+                if isinstance(val, str):
+                    field_schema = next((f for f in self.collection.schema.fields if f.name == name), None)
+                    if field_schema and field_schema.dtype == DataType.VARCHAR:
+                        max_len = field_schema.max_length or self.VARCHAR_MAX_LENGTH
+                        original_len = len(val)
+                        if original_len > max_len:
+                            val = val[:max_len]
+                            print(f"⚠️ Truncated field '{name}' from {original_len} to {max_len} characters")
                 insert_data.append([val])
 
         result = self.collection.insert(insert_data)

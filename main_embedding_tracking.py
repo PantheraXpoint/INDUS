@@ -6,15 +6,15 @@ Main script for embedding-based object tracking and search
 import os
 import sys
 import argparse
-from typing import List, Dict
 import cv2
 import time
 from llms.init_model import init_model
 from llms.BaseModel import BaseLanguageModel
 from PIL import Image
-import ulid
-import json
 import concurrent.futures
+from dataset.init_dataset import init_dataset, get_video_idx
+import time
+import json
 
 # Add embeddings directory to path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'embeddings'))
@@ -151,7 +151,8 @@ def search_video(query: str, video_path: str, output_dir: str,
                               object_faiss_db_path: str = "database/object_embeddings.faiss",
                               event_faiss_db_path: str = "database/event_embeddings.faiss",
                               object_sqlite_db_path: str = "database/tracked_objects.db",
-                              k: int = 5, max_images: int = 10, llm: BaseLanguageModel = None):
+                              k: int = 5, max_images: int = 10, llm: BaseLanguageModel = None,
+                              question_id: int = -1):
     """
     Search for objects by description and extract bounding box images
     
@@ -177,7 +178,7 @@ def search_video(query: str, video_path: str, output_dir: str,
     object_search_system = SearchSystem(object_faiss_db_path, object_sqlite_db_path, embedding_model)
     event_search_system = SearchSystem(event_faiss_db_path, None, embedding_model)
     search_results = tri_view_retrieval(query, event_search_system, object_search_system, llm, "both")
-    filtered_search_results = filter_answer_generation(search_results, llm, video_path)
+    filtered_search_results = filter_answer_generation(search_results, llm, video_path, question_id)
     saved_images = []
     for result, filtered_answer in zip(search_results, filtered_search_results):
         if result["event_description"] != "":
@@ -188,7 +189,7 @@ def search_video(query: str, video_path: str, output_dir: str,
         # entities_result = [entity for entity in result["entities"] if int(entity["id"]) in filtered_answer["track_ids"]]
         entities_result = result["entities"]
         print("There are ", len(filtered_answer.get("track_ids", [])), " entities.")
-        saved_images = filter_and_extract_bounding_box(video_path, entities_result, output_dir, max_images)
+        # saved_images = filter_and_extract_bounding_box(video_path, entities_result, output_dir, max_images)
     return search_results, saved_images
 
 def get_database_statistics(faiss_db_path: str = "embeddings.faiss",
@@ -225,9 +226,15 @@ def get_database_statistics(faiss_db_path: str = "embeddings.faiss",
 def main():
     """Main function"""
     parser = argparse.ArgumentParser(description='Embedding-based Object Tracking and Search')
+    parser.add_argument('--dataset', type=str, default=None,
+                       help='Dataset to use (AVA, LVbench, etc.)')
+    parser.add_argument('--video_id', type=int, default=-1,
+                       help='ID of the video to process')
+    parser.add_argument('--question_id', type=int, default=-1,
+                       help='ID of the question to process')
     parser.add_argument('--model', type=str, default='qwenvl',
                        help='Model to use')
-    parser.add_argument('--video', type=str, required=True,
+    parser.add_argument('--video', type=str, default=None,
                        help='Path to input video file')
     parser.add_argument('--description', type=str,
                        help='Text description to search for')
@@ -241,46 +248,99 @@ def main():
                        help='Show database statistics')
     parser.add_argument('--process-only', action='store_true',
                        help='Only process video without searching')
+    parser.add_argument('--video-range', type=str, default=None,
+                       help='Range of videos to process (e.g. "1-10" for videos 1 to 10)')
     
     args = parser.parse_args()
     llm = init_model(args.model, 1)
-    if not os.path.exists(args.video):
-        print(f"Error: Video file {args.video} does not exist")
-        return
 
-    base_path = os.path.join("database", os.path.basename(args.video)[:-4])
-    if not os.path.exists(base_path):
-        os.makedirs(base_path)
-    object_faiss_db_path = os.path.join(base_path, "object_embeddings.db")
-    event_faiss_db_path = os.path.join(base_path, "event_embeddings.db")
-    object_sqlite_db_path = os.path.join(base_path, "tracked_objects.db")
-    
-    # Process video with embeddings
-    if args.process_only and not args.description:
-        print("Processing video with embedding generation...")
-        import time
-        start_time = time.time()
-        result = process_video(args.video, object_faiss_db_path, event_faiss_db_path, object_sqlite_db_path, llm)
-        end_time = time.time()
-        print(f"Time taken for video processing: {end_time - start_time} seconds")
-        if result is None:
-            print("Failed to process video")
-            return
-        embedding_model, detector = result
-        print("Video processing completed successfully!")
-    
-    # Show statistics
-    if args.stats:
-        get_database_statistics(object_faiss_db_path, object_sqlite_db_path)
-    
-    # Search and extract objects
-    if args.description:
-        print(f"\nSearching for objects matching: '{args.description}'")
-        search_results, saved_images = search_video(
-            args.description, args.video, args.output_dir,
-            object_faiss_db_path, event_faiss_db_path, object_sqlite_db_path,
-            args.k, args.max_images, llm
-        )
+    if args.dataset is None:
+        base_path = os.path.join("database", os.path.basename(args.video)[:-4])
+        if not os.path.exists(base_path):
+            os.makedirs(base_path)
+        object_faiss_db_path = os.path.join(base_path, "object_embeddings.db")
+        event_faiss_db_path = os.path.join(base_path, "event_embeddings.db")
+        object_sqlite_db_path = os.path.join(base_path, "tracked_objects.db")
+        # Process video with embeddings
+        if args.process_only and not args.description:
+            print("Processing video with embedding generation...")
+            start_time = time.time()
+            result = process_video(args.video, object_faiss_db_path, event_faiss_db_path, object_sqlite_db_path, llm)
+            end_time = time.time()
+            print(f"Time taken for video processing: {end_time - start_time} seconds")
+            if result is None:
+                print("Failed to process video")
+                return
+            embedding_model, detector = result
+            print("Video processing completed successfully!")
+        
+        # Show statistics
+        if args.stats:
+            get_database_statistics(object_faiss_db_path, object_sqlite_db_path)
+        
+        # Search and extract objects
+        if args.description:
+            print(f"\nSearching for objects matching: '{args.description}'")
+            search_results, saved_images = search_video(
+                args.description, args.video, args.output_dir,
+                object_faiss_db_path, event_faiss_db_path, object_sqlite_db_path,
+                args.k, args.max_images, llm
+            )
+    else:
+        dataset = init_dataset(args.dataset)
+        # Process video with embeddings
+        if args.process_only:
+            if args.video_range is not None:
+                start_video, end_video = map(int, args.video_range.split('-'))
+                print(f"Processing videos {start_video} to {end_video}...")
+                for video_id in range(start_video, end_video + 1):
+                    video, object_faiss_db_path, event_faiss_db_path, object_sqlite_db_path = dataset.get_video(video_id)
+                    print(f"Processing video {video_id} with embedding generation...")
+                    start_time = time.time()
+                    result = process_video(video, object_faiss_db_path, event_faiss_db_path, object_sqlite_db_path, llm)
+                    end_time = time.time()
+                    total_time = end_time - start_time
+                    json.dump({
+                        "video_id": video_id,
+                        "time": total_time
+                    }, open(f"results/{args.dataset}_{args.model}_{video_id}.json", "w"))
+                    print(f"Time taken for video {video_id} processing: {total_time} seconds")
+            elif args.video_id == -1:
+                for video_id in range(get_video_idx(args.dataset)[0], get_video_idx(args.dataset)[1] + 1):
+                    video, object_faiss_db_path, event_faiss_db_path, object_sqlite_db_path = dataset.get_video(video_id)
+                    print(f"Processing video {video_id} with embedding generation...")
+                    start_time = time.time()
+                    result = process_video(video, object_faiss_db_path, event_faiss_db_path, object_sqlite_db_path, llm)
+                    end_time = time.time()
+                    print(f"Time taken for video processing: {end_time - start_time} seconds")
+            else:
+                video, object_faiss_db_path, event_faiss_db_path, object_sqlite_db_path = dataset.get_video(args.video_id)
+                print(f"Processing video {args.video_id} with embedding generation...")
+                start_time = time.time()
+                result = process_video(video, object_faiss_db_path, event_faiss_db_path, object_sqlite_db_path, llm)
+                end_time = time.time()
+                print(f"Time taken for video processing: {end_time - start_time} seconds")
+        if args.question_id == -1:
+            for video_id in range(1, len(dataset) + 1):
+                if args.video_id != -1 and video_id != args.video_id:
+                    continue
+                video, object_faiss_db_path, event_faiss_db_path, object_sqlite_db_path = dataset.get_video(video_id)
+                for question_id in range(len(dataset.get_video_info(video_id)["qa"])):
+                    search_results, saved_images = search_video(
+                        dataset.get_video_info(video_id)["qa"][question_id]["question"], video, args.output_dir,
+                        object_faiss_db_path, event_faiss_db_path, object_sqlite_db_path,
+                        args.k, args.max_images, llm, 
+                        question_id
+                    )
+        elif args.question_id != -1:
+            video, object_faiss_db_path, event_faiss_db_path, object_sqlite_db_path = dataset.get_video(args.video_id)
+            question = dataset.get_video_info(args.video_id)["qa"][args.question_id]["question"]
+            search_results, saved_images = search_video(
+                question, video, args.output_dir,
+                object_faiss_db_path, event_faiss_db_path, object_sqlite_db_path,
+                args.k, args.max_images, llm, 
+                args.question_id
+            )
 
 if __name__ == "__main__":
     main()

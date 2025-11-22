@@ -588,3 +588,50 @@ Image: (contains bounding boxes labeled like ID: 1, person”, ID: 2, car”, et
   "analysis": "<brief reasoning based on visible cues and context>" 
 }}
 """
+
+PROMPTS["summary_and_answer_augmented"] = """
+You are an expert in video scene understanding and grounding natural language to tracked objects.
+
+You are given four inputs:
+1) Query: a short phrase describing what the user is asking about (e.g., "the woman", "the person walking", "the baby").
+2) Description: a full free-text scene description.
+3) Tracks: a JSON list of tracked objects, each with:
+   - track_id (int)
+   - class (string, e.g., "person", "car", "dog")
+   - boxes: a list of detections for that track across time, each item having:
+       * frame_number (int), with the corresponding frame number in the given frames sequence.
+       * bbox [x_min, y_min, x_max, y_max] in pixel coordinates (top-left, bottom-right), this is normalized to 1000x1000 pixels.
+4) Frames: a list of images where all detected or tracked objects are already annotated with bounding boxes labeled as ID: <number>” and their class name (e.g., ID: 1, person”).
+
+### Your task:
+- Identify which track_id(s) best match the Query by aligning the Description to the Tracks.
+- Only select track IDs that exist in the provided Tracks input.
+- Based on your analysis, choose the best matching track(s) and provide the corresponding multiple-choice answer (A, B, C, or D).
+
+### Matching guidance (apply pragmatically; do NOT explain these rules in the output):
+- **Class compatibility:** Prefer tracks whose `class` matches the Query (e.g., "man/woman/person" → class "person"; "car/vehicle" → class "car"/"truck", etc.). Use reasonable synonyms/singular/plural mapping.
+- **Action & motion cues:** If the Description/Query mentions actions (e.g., walking, running, sitting, opening, carrying), infer from temporal bbox patterns (movement vs. static size/position changes) and prefer tracks whose motion plausibly fits.
+- **Spatial cues (left/right/center/front/back/near/far):** Approximate from bbox center x,y and area across frames. (Left = smaller x; right = larger x; center = mid-range; near = larger area; far = smaller area.)
+- **Temporal cues:** If the Description mentions entering/exiting/approaching/stopping, use the sequence of boxes to favor tracks that appear accordingly (e.g., moving from edge inward).
+- **Quantity cues:** If Query implies multiple entities ("two people"), return multiple track_ids that best satisfy count + other cues.
+- **Salience:** When ambiguous, favor tracks with longer visibility, clearer motion consistent with the Query, and better class match.
+- **No hallucination:** Never invent track IDs; only choose from Tracks. If nothing fits, return an empty list.
+
+### Output format:
+Return your review, reference, and reasoning process in the `Analysis` field and the answer in the `Answer` field. Choose one of the following options based on your analysis:
+- A) [First option]
+- B) [Second option]
+- C) [Third option]
+- D) [Fourth option]
+
+### Inputs:
+Query: {query}
+Description: {description}
+Tracks (JSON): {tracks_json}
+
+### Output (strict JSON only):
+{{ 
+  "Analysis": "<Brief reasoning about how the tracks match the query based on class, action, motion, etc.>", 
+  "Answer": "[A, B, C, or D]" 
+}}
+"""

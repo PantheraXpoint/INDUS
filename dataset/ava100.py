@@ -54,8 +54,10 @@ class AVA100(Dataset):
     def get_video(self, video_id: Union[int, str]):
         video_info = self.get_video_info(video_id)
         video_path = video_info["video_path"]
-        work_path = os.path.join(self.work_path, f"{video_id}")
-        if not os.path.exists(work_path):
-            os.makedirs(work_path)
-        
-        return VideoRepresentation(video_path, work_path)
+        base_path = os.path.join("database", os.path.basename(video_path)[:-4])
+        if not os.path.exists(base_path):
+            os.makedirs(base_path)
+        object_faiss_db_path = os.path.join(base_path, "object_embeddings.db")
+        event_faiss_db_path = os.path.join(base_path, "event_embeddings.db")
+        object_sqlite_db_path = os.path.join(base_path, "tracked_objects.db")
+        return video_path, object_faiss_db_path, event_faiss_db_path, object_sqlite_db_path

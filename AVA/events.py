@@ -8,7 +8,7 @@ from video_utils import VideoRepresentation
 from .prompt import PROMPTS
 from bert_score import score, BERTScorer
 from .utils import compute_mdhash_id, clean_str
-from crying import predict_audio_chunks, extract_audio_from_mp4
+# from crying import predict_audio_chunks, extract_audio_from_mp4
 
 def get_chunk_timestamp(video, chunk_duration, chunk_overlap):
     video_config = video.config

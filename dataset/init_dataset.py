@@ -22,8 +22,8 @@ def get_video_idx(dataset_name):
         raise ValueError(f"Dataset {dataset_name} not found in video_idx_zoo. Supported datasets: {supported_datasets}")
     return video_idx_zoo[dataset_name]
 
-def init_dataset(dataset_name, video_path=None):
+def init_dataset(dataset_name):
     if dataset_name not in dataset_zoo:
         supported_datasets = ", ".join(dataset_zoo.keys())
         raise ValueError(f"Dataset {dataset_name} not found in dataset_zoo. Supported datasets: {supported_datasets}")
-    return dataset_zoo[dataset_name](video_path=video_path)
+    return dataset_zoo[dataset_name]()
