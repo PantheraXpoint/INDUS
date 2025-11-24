@@ -27,7 +27,7 @@ class ObjectDetectorTracker:
     def __init__(self, model_path: str = "yolo11n.pt", conf_threshold: float = 0.5, 
                  iou_threshold: float = 0.5, tracker_config: str = "config/tracker.yaml",
                  embedding_model: Optional[JinaCLIP] = None, faiss_db_path: str = "embeddings.faiss",
-                 sqlite_db_path: str = "tracked_objects.db"):
+                 sqlite_db_path: str = "tracked_objects.db", use_persistent_sqlite: bool = False):
         """
         Initialize the object detector and tracker
         
@@ -39,6 +39,8 @@ class ObjectDetectorTracker:
             embedding_model: JinaCLIP embedding model for generating embeddings
             faiss_db_path: Path to FAISS database
             sqlite_db_path: Path to SQLite database
+            use_persistent_sqlite: If True, use persistent SQLite connection (faster but uses more resources).
+                                   If False, use per-request connections (lighter, better for vLLM)
         """
         self.model = YOLO(model_path)
         self.conf_threshold = conf_threshold
@@ -58,7 +60,8 @@ class ObjectDetectorTracker:
         
         # Colors for visualization (BGR format)
         self.colors = self._generate_colors(80)  # COCO dataset has 80 classes
-        # TODO: this could be extended to infinity if we use a open-ended video causing OOM in RAM.
+        self.batch_embedding = []
+        
         
     def _generate_colors(self, num_classes: int) -> List[Tuple[int, int, int]]:
         """Generate distinct colors for each class"""
@@ -399,7 +402,6 @@ class ObjectDetectorTracker:
                     roi_rgb = roi
                     # Generate embedding
                     roi_pil = Image.fromarray(roi_rgb)
-                    embedding = self.embedding_model.get_image_features([roi_pil])[0]
 
                     id = str(tracked_object["track_id"])
                     # Store in FAISS database
@@ -412,11 +414,16 @@ class ObjectDetectorTracker:
                         'class_name': tracked_object["class_name"],
                         'event_id': tracked_object["event_id"],
                     }
-                    faiss_id = self.faiss_db.add_embedding(embedding, id, metadata)
-                    print(f"Generated embedding for new track {id} (FAISS ID: {faiss_id})")
+                    self.batch_embedding.append((roi_pil, id, metadata))
+                    if len(self.batch_embedding) == 64:
+                        roi_pils, ids, metadatas = zip(*self.batch_embedding)    
+                        embeddings = self.embedding_model.get_image_features(roi_pils)
+                        self.batch_embedding = []
+                        for embedding, id, metadata in zip(embeddings, ids, metadatas):
+                            faiss_id = self.faiss_db.add_embedding(embedding, id, metadata)
                     
             except Exception as e:
-                print(f"Error generating embedding for track {id}: {e}")
+                print(f"Error generating embedding for tracks {ids}: {e}")
 
 def main():
     """Main function for testing the ObjectDetectorTracker"""

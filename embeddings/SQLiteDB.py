@@ -17,7 +17,9 @@ class SQLiteDB:
             db_path: Path to SQLite database file
         """
         self.db_path = db_path
+        self._conn = None
         self._create_tables()
+        self._enable_wal_mode()
     
     def _create_tables(self):
         """Create necessary tables if they don't exist"""
@@ -43,6 +45,10 @@ class SQLiteDB:
             )
         ''')
         
+        # Create indexes for faster lookups
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_track_id ON tracked_objects(track_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_track_class ON tracked_objects(track_id, class_id)')
+        
         # Create video_info table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS video_info (
@@ -59,6 +65,45 @@ class SQLiteDB:
         
         conn.commit()
         conn.close()
+    
+    def _enable_wal_mode(self):
+        """Enable WAL mode for better concurrency and performance"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.execute('PRAGMA journal_mode=WAL')
+            conn.execute('PRAGMA synchronous=NORMAL')
+            conn.execute('PRAGMA cache_size=10000')
+            conn.execute('PRAGMA temp_store=MEMORY')
+            conn.close()
+        except Exception as e:
+            print(f"Warning: Could not enable WAL mode: {e}")
+    
+    def _get_connection(self):
+        """Get or create a persistent connection"""
+        if self._conn is None:
+            self._conn = sqlite3.connect(self.db_path)
+            self._conn.execute('PRAGMA journal_mode=WAL')
+            self._conn.execute('PRAGMA synchronous=NORMAL')
+            self._conn.execute('PRAGMA cache_size=10000')
+        return self._conn
+    
+    def _reconnect(self):
+        """Reconnect to the database"""
+        try:
+            if self._conn is not None:
+                self._conn.close()
+        except:
+            pass
+        self._conn = sqlite3.connect(self.db_path)
+        self._conn.execute('PRAGMA journal_mode=WAL')
+        self._conn.execute('PRAGMA synchronous=NORMAL')
+        self._conn.execute('PRAGMA cache_size=10000')
+    
+    def close(self):
+        """Close the database connection"""
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
     
     def add_tracked_object(self, track_id: int, class_id: int, class_name: str, 
                           bbox_history: List[int], confidence_history: float, 
@@ -78,36 +123,41 @@ class SQLiteDB:
             True if existing, False otherwise
         """
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = self._get_connection()
             cursor = conn.cursor()
             
-            # Check if track_id already exists
-            cursor.execute('SELECT id FROM tracked_objects WHERE track_id = ? AND class_id = ?', (track_id, class_id))
-            existing = cursor.fetchone()
+            # Single query to get all needed data (combines both previous SELECTs)
+            cursor.execute('''
+                SELECT bbox_history, confidence_history, frame_numbers, event_id 
+                FROM tracked_objects 
+                WHERE track_id = ?
+            ''', (track_id,))
+            existing_histories = cursor.fetchone()
             
-            if existing:
+            if existing_histories:
                 # Update existing record, append new history to existing JSON lists
-                cursor.execute('SELECT bbox_history, confidence_history, frame_numbers, event_id FROM tracked_objects WHERE track_id = ? AND class_id = ?', (track_id, class_id))
-                existing_histories = cursor.fetchone()
-                if existing_histories:
-                    # Load existing histories
-                    existing_bbox_history = json.loads(existing_histories[0])
-                    existing_confidence_history = json.loads(existing_histories[1])
-                    existing_frame_numbers = json.loads(existing_histories[2])
-                    existing_event_id = json.loads(existing_histories[3])
+                # Load existing histories
+                existing_bbox_history = json.loads(existing_histories[0])
+                existing_confidence_history = json.loads(existing_histories[1])
+                existing_frame_numbers = json.loads(existing_histories[2])
+                existing_event_id = json.loads(existing_histories[3])
 
-                    # Append new histories
-                    updated_bbox_history = existing_bbox_history + [bbox_history]
-                    updated_confidence_history = existing_confidence_history + [confidence_history]
-                    updated_frame_numbers = existing_frame_numbers + [frame_numbers]
-                    updated_event_id = existing_event_id
-                    if event_id not in existing_event_id:
-                        updated_event_id = existing_event_id + [event_id]
-                else:
-                    updated_bbox_history = bbox_history
-                    updated_confidence_history = confidence_history
-                    updated_frame_numbers = frame_numbers
-                    updated_event_id = event_id
+                # Append new histories
+                updated_bbox_history = existing_bbox_history + [bbox_history]
+                updated_confidence_history = existing_confidence_history + [confidence_history]
+                updated_frame_numbers = existing_frame_numbers + [frame_numbers]
+                updated_event_id = existing_event_id
+                if event_id not in existing_event_id:
+                    updated_event_id = existing_event_id + [event_id]
+
+                # Serialize JSON once
+                bbox_json = json.dumps(updated_bbox_history)
+                conf_json = json.dumps(updated_confidence_history)
+                frames_json = json.dumps(updated_frame_numbers)
+                event_json = json.dumps(updated_event_id)
+                
+                max_frame = max(updated_frame_numbers)
+                total_frames = len(updated_frame_numbers)
 
                 cursor.execute('''
                     UPDATE tracked_objects 
@@ -115,32 +165,53 @@ class SQLiteDB:
                         bbox_history = ?, confidence_history = ?, frame_numbers = ?,
                         event_id = ?, updated_at = CURRENT_TIMESTAMP
                     WHERE track_id = ?
-                ''', (class_id, class_name, max(updated_frame_numbers), len(updated_frame_numbers),
-                      json.dumps(updated_bbox_history), json.dumps(updated_confidence_history),
-                      json.dumps(updated_frame_numbers), json.dumps(updated_event_id), track_id))
+                ''', (class_id, class_name, max_frame, total_frames,
+                      bbox_json, conf_json, frames_json, event_json, track_id))
+                
+                conn.commit()
+                return True
             else:
                 # Insert new record
-                bbox_history = [bbox_history]
-                confidence_history = [confidence_history]
-                frame_numbers = [frame_numbers]
-                event_id = [event_id]
+                bbox_list = [bbox_history]
+                conf_list = [confidence_history]
+                frames_list = [frame_numbers]
+                event_list = [event_id]
+                
+                # Serialize JSON once
+                bbox_json = json.dumps(bbox_list)
+                conf_json = json.dumps(conf_list)
+                frames_json = json.dumps(frames_list)
+                event_json = json.dumps(event_list)
+                
                 cursor.execute('''
                     INSERT INTO tracked_objects 
                     (track_id, class_id, class_name, first_frame, last_frame, total_frames,
                      bbox_history, confidence_history, frame_numbers, event_id)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (track_id, class_id, class_name, min(frame_numbers), max(frame_numbers),
-                      len(frame_numbers), json.dumps(bbox_history), json.dumps(confidence_history),
-                      json.dumps(frame_numbers), json.dumps(event_id)))
+                ''', (track_id, class_id, class_name, frame_numbers, frame_numbers, 1,
+                      bbox_json, conf_json, frames_json, event_json))
+                
+                conn.commit()
+                return False
             
-            conn.commit()
-            conn.close()
-            if existing:
-                return True
-            return False
-            
+        except (sqlite3.OperationalError, sqlite3.ProgrammingError) as e:
+            # Connection might be stale, try reconnecting once
+            try:
+                self._reconnect()
+                conn = self._get_connection()
+                cursor = conn.cursor()
+                # Retry the operation (simplified - just return False on retry failure)
+                print(f"Error adding tracked object, reconnected: {e}")
+                return False
+            except Exception as e2:
+                print(f"Error adding tracked object after reconnect: {e2}")
+                return False
         except Exception as e:
             print(f"Error adding tracked object: {e}")
+            try:
+                conn.rollback()
+            except:
+                pass
             return False
     
     def get_tracked_object(self, track_id: int) -> Optional[Dict]:

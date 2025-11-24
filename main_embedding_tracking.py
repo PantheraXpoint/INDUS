@@ -77,8 +77,8 @@ def process_video(video_path: str, object_faiss_db_path: str = "object_embedding
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
     # Set processing fps to 10fps
-    tracking_processing_fps = 10
-    event_processing_fps = 3
+    tracking_processing_fps = 5
+    event_processing_fps = 2
     chunk_duration = 3
     tracking_frame_skip = max(1, original_fps // tracking_processing_fps)  # Skip frames to achieve 10fps processing
     event_frame_skip = max(1, original_fps // event_processing_fps)  # Skip frames to achieve 3fps processing
@@ -101,7 +101,7 @@ def process_video(video_path: str, object_faiss_db_path: str = "object_embedding
     detected_objects = []
     video_chunk_num_frames = int(event_processing_fps * chunk_duration)
     event_id = 0
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
     future_chunk = None
     while True:
         ret, frame = cap.read()
@@ -117,8 +117,7 @@ def process_video(video_path: str, object_faiss_db_path: str = "object_embedding
         if frame_count % event_frame_skip == 0:
             # Process event
             frame_indices.append(frame_count)
-            # frames.append(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
-            frames.append(Image.fromarray(cv2.cvtColor(cv2.resize(frame, (1280, 720)), cv2.COLOR_BGR2RGB)))
+            frames.append(Image.fromarray(cv2.cvtColor(cv2.resize(frame, (540, 360)), cv2.COLOR_BGR2RGB)))
         
         if len(frame_indices) == video_chunk_num_frames:
             event_id = frame_indices[0]
