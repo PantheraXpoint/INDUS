@@ -110,6 +110,7 @@ class KnowledgeGraphInterface:
         return 5 # Example: Object appears in 5 events globally
 
     def get_relations_involving_object(self, object_id: str) -> List[Dict]:
+        # NOTE: This is now unused as relation expansion is context-only.
         # Returns [{'target_id': 'obj_99', 'type': 'is_related_to'}]
         return []
 

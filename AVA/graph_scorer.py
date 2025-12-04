@@ -17,7 +17,11 @@ class GraphScorer:
             'object_to_event': 0.75,    # Structure (Uniqueness applies)
             'vector_object': 0.5,       # Inference (Risky - Compass Rule)
             'vector_event': 0.6,        # Inference (Bridge)
-            'relation': 0.95            # Fact (Explicit)
+            'relation': 0.95,           # Fact (Explicit KG relation)
+            
+            # NEW CONTEXT-BASED RELATIONS: High trust as they come from previous reasoned subgraphs
+            'context_relation': 0.90,       # Object->Object from Context Graph
+            'context_event_to_event': 0.80  # Event->Event from Context Graph
         }
 
     def compute_similarity(self, vec_a, vec_b) -> float:
