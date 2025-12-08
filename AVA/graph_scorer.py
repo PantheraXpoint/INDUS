@@ -13,15 +13,14 @@ class GraphScorer:
         # Policy: Trust factors for different operations
         self.trust_map = {
             'init': 1.0,
-            'event_to_object': 0.85,    # Structure (Hub Penalty applies)
-            'object_to_event': 0.75,    # Structure (Uniqueness applies)
-            'vector_object': 0.5,       # Inference (Risky - Compass Rule)
-            'vector_event': 0.6,        # Inference (Bridge)
-            'relation': 0.95,           # Fact (Explicit KG relation)
+            'event_to_object': 0.9,    # Structure (Hub Penalty applies)
+            'object_to_event': 0.9,    # Structure (Uniqueness applies)
+            'vector_object': 0.6,       # Inference (Risky - Compass Rule)
+            'vector_event': 0.5,        # Inference (Bridge)
             
-            # NEW CONTEXT-BASED RELATIONS: High trust as they come from previous reasoned subgraphs
-            'context_relation': 0.90,       # Object->Object from Context Graph
-            'context_event_to_event': 0.80  # Event->Event from Context Graph
+            # CONTEXT-BASED: Object↔Object and Event↔Event ONLY via Context (no KG structure)
+            'context_relation': 0.8,       # Object→Object from Context Graph
+            'context_event_to_event': 0.7  # Event→Event from Context Graph
         }
 
     def compute_similarity(self, vec_a, vec_b) -> float:
@@ -49,6 +48,8 @@ class GraphScorer:
     def calculate_energy_transfer(self, 
                                   source_score: float, 
                                   op_type: str, 
+                                  strategy_mode: str = 'BALANCED',
+                                  current_iteration: int = 1,
                                   hub_size: int = 1,
                                   global_uniqueness: int = 1,
                                   node_embedding: Optional[np.ndarray] = None,
@@ -56,9 +57,26 @@ class GraphScorer:
                                   query_embedding: Optional[np.ndarray] = None) -> float:
         """
         Calculates how much 'Heat' flows from Parent -> Child based on heuristics.
+        
+        Args:
+            strategy_mode: Current graph exploration strategy ('GROUNDING', 'BRIDGING', 'LEAPING', 'TRIANGULATION', 'BALANCED')
+                          Affects trust multipliers dynamically.
+            current_iteration: Current iteration number (for time-based damping)
         """
-        # 1. Base Energy
-        trust = self.trust_map.get(op_type, 0.5)
+        # 1. Base Energy with Dynamic Trust Adjustment
+        base_trust = self.trust_map.get(op_type, 0.5)
+        
+        # Apply strategy-specific trust multipliers
+        if strategy_mode in ['GROUNDING', 'BRIDGING']:
+            # Structural modes: BOOST trust (we need these nodes to stabilize)
+            trust = base_trust * 1.12
+        elif strategy_mode == 'LEAPING':
+            # Inference mode: PENALIZE trust (only best matches should survive risky jumps)
+            trust = base_trust * 0.83
+        else:
+            # TRIANGULATION or BALANCED: Use base trust
+            trust = base_trust
+        
         energy = source_score * self.base_decay * trust
 
         # 2. Structural Penalties/Bonuses
@@ -91,6 +109,13 @@ class GraphScorer:
                 relevance = global_sim
                 
             energy *= relevance
+
+        # 4. Time-Based Damping (Score Convergence Prevention)
+        # Formula: energy / ln(iteration + 2)
+        # Effect: Iter 1 → ÷1.1 (10% damping), Iter 10 → ÷2.5 (60% damping)
+        # This forces score convergence and prevents saturation
+        damping_divisor = math.log(current_iteration + 2)
+        energy = energy / damping_divisor
 
         return energy
 
