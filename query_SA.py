@@ -94,21 +94,6 @@ if __name__ == "__main__":
         
         final_sa_answer = ava.generate_SA_answer(qas[args.question_id]["question"], args.question_id)
         print(final_sa_answer)
-    elif args.question is not None:
-        dataset = init_dataset(args.dataset, args.video_path)
-        llm = init_model(args.model, args.gpus)
-        
-        video = dataset.get_video()
-        
-        ava = AVA(
-            video=video,
-            llm_model=llm,
-        )
-        
-        ava.query_tree_search(args.question)
-        
-        final_sa_answer = ava.generate_SA_answer(args.question)
-        print(final_sa_answer)
     else:
         # Validate process number
         if args.process_num is None:

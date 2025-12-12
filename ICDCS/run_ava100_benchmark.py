@@ -222,10 +222,11 @@ class AVA100Benchmark:
             )
             
             # Context graph: video-specific to accumulate query history
-            self.current_ctx = ContextGraphInterface(
-                db_path=f"database/{video_key}_context.db",
-                embedding_dim=768
-            )
+            # self.current_ctx = ContextGraphInterface(
+            #     db_path=f"database/{video_key}_context.db",
+            #     embedding_dim=768
+            # )
+            self.current_ctx = None
             self.active_connection_aliases.append(f'milvus_{video_key}_context')
             
             self.current_scorer = GraphScorer()

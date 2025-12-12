@@ -183,7 +183,10 @@ def tri_view_retrieval(
     
     # Generate responses
     batch_outputs = llm.batch_generate_response(batch_inputs)
-    duration_filter = json.loads(batch_outputs[0]) if batch_outputs[0] != "None" else None
+    try:
+        duration_filter = json.loads(batch_outputs[0]) if batch_outputs[0] != "None" else None
+    except:
+        duration_filter = None
 
     # Process results based on mode
     output_idx = 1
@@ -263,6 +266,7 @@ def tri_view_retrieval(
         related_entities = []       
         if events_result:
             matching_events = [event for event in events_result if event["id"] == event_id]
+            event_duration = None
             if len(matching_events) > 0:
                 matching_events = matching_events[0]
                 event_duration = [int(matching_events['faiss_metadata']['start_time']), int(matching_events['faiss_metadata']['end_time'])]
@@ -309,7 +313,11 @@ def filter_answer_generation(results: list, llm: BaseLanguageModel, video_path: 
         except:
             step = 2
         num_frames = 10
-        new_step = (result["event_duration"][1] - result["event_duration"][0]) // num_frames
+        try:
+            new_step = (result["event_duration"][1] - result["event_duration"][0]) // num_frames
+        except:
+            new_step = 1
+            result["event_duration"] = [0, 0]
         i = 1
         while step * i <= new_step:
             i += 1
@@ -392,11 +400,31 @@ def build_filter_expression(filter: Optional[Dict[str, Any]] = None) -> str:
     filter_expr = []
     for key, value in filter.items():
         if isinstance(value, list):
-            for item in value:
-                filter_expr.append(f"{key} == {item}")
+            # Use 'in' operator for lists instead of many OR conditions
+            # This avoids Milvus "unsupported expr proto node" error with long OR chains
+            if len(value) == 0:
+                continue
+            elif len(value) == 1:
+                filter_expr.append(f"{key} == {value[0]}")
+            else:
+                # Convert items to appropriate format
+                # Try to convert to int if possible (for numeric fields like track_id)
+                formatted_values = []
+                for item in value:
+                    item_str = str(item).strip()
+                    try:
+                        # Try converting to int for numeric fields
+                        formatted_values.append(str(int(item_str)))
+                    except (ValueError, TypeError):
+                        # Keep as string if conversion fails
+                        formatted_values.append(f'"{item_str}"')
+                value_str = ", ".join(formatted_values)
+                filter_expr.append(f"{key} in [{value_str}]")
         else:
             filter_expr.append(f"{key} == {value}")
-    return " or ".join(filter_expr)
+    if not filter_expr:
+        return None
+    return " and ".join(filter_expr) if len(filter_expr) > 1 else filter_expr[0]
 
 def build_filter_expression_for_time(filter: Optional[Dict[str, Any]] = None) -> str:
     """Build a filter expression for Milvus for time."""

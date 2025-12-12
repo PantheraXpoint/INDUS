@@ -11,6 +11,8 @@ if __name__ == "__main__":
     parser.add_argument("--model", default="qwenvl", help="Name of the LLM model to use")
     parser.add_argument("--dataset", default="lvbench", help="Name of the dataset")
     parser.add_argument("--video_id", type=int, default=-1, help="ID of the video to process")
+    parser.add_argument("--video_start", type=int, help="Start video ID for batch processing (used when video_id=-1)")
+    parser.add_argument("--video_end", type=int, help="End video ID for batch processing (used when video_id=-1)")
     parser.add_argument("--question_id", type=int, help="ID of the question to process")
     parser.add_argument("--gpus", type=int, default=1, help="Number of GPUs to use")
     
@@ -47,10 +49,9 @@ if __name__ == "__main__":
         llm = init_model(args.model, args.gpus)
         video_idx = get_video_idx(args.dataset)
         
-        last_video_id = results[-1]["video_id"] if results else video_idx[0]
         last_question_id = results[-1]["question_id"] if results else -1
         
-        for video_id in range(last_video_id, video_idx[1] + 1):
+        for video_id in range(args.video_start, args.video_end + 1):
             video = dataset.get_video(video_id)
             video_info = dataset.get_video_info(video_id=video_id)
             qas = video_info["qa"]

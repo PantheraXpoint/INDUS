@@ -186,3 +186,7 @@ datas/*/videos/*
 
 /test*AVA_cache/
 datas/
+ava100_results/
+database/
+graph_engine_output/
+checkpoints/

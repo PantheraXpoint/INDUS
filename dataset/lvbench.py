@@ -35,8 +35,14 @@ class LVBench(Dataset):
 
         return video_info
     
-    def get_video(self, video_id):        
+    def get_video(self, video_id, ours=False):        
         source_path = self.video_infos[video_id-1]["video_path"]
+        # if not ours:
+        #     work_path = os.path.join(self.work_path, f"{video_id}")
+        #     if not os.path.exists(work_path):
+        #         os.makedirs(work_path)
+            
+        #     return VideoRepresentation(source_path, work_path)
         base_path = os.path.join("database", os.path.basename(source_path)[:-4])
         if not os.path.exists(base_path):
             os.makedirs(base_path)

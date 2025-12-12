@@ -21,8 +21,8 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'embeddings'))
 
 from JinaCLIP import JinaCLIP
 from embeddings.object_search import SearchSystem, filter_and_extract_bounding_box
-from AVA.object_detect import ObjectDetectorTracker
-from AVA.event_tracker import EventTracker
+from ICDCS.object_detect import ObjectDetectorTracker
+from ICDCS.event_tracker import EventTracker
 from AVA.utils import tri_view_retrieval, filter_answer_generation
 
 def process_video(video_path: str, object_faiss_db_path: str = "object_embeddings.faiss", 
@@ -320,10 +320,11 @@ def main():
                 end_time = time.time()
                 print(f"Time taken for video processing: {end_time - start_time} seconds")
         if args.question_id == -1:
-            for video_id in range(1, len(dataset) + 1):
+            for video_id in range(get_video_idx(args.dataset)[0], get_video_idx(args.dataset)[1] + 1):
                 if args.video_id != -1 and video_id != args.video_id:
                     continue
                 video, object_faiss_db_path, event_faiss_db_path, object_sqlite_db_path = dataset.get_video(video_id)
+                print(f"Processing video {video}")
                 for question_id in range(len(dataset.get_video_info(video_id)["qa"])):
                     search_results, saved_images = search_video(
                         dataset.get_video_info(video_id)["qa"][question_id]["question"], video, args.output_dir,
@@ -334,12 +335,15 @@ def main():
         elif args.question_id != -1:
             video, object_faiss_db_path, event_faiss_db_path, object_sqlite_db_path = dataset.get_video(args.video_id)
             question = dataset.get_video_info(args.video_id)["qa"][args.question_id]["question"]
-            search_results, saved_images = search_video(
-                question, video, args.output_dir,
-                object_faiss_db_path, event_faiss_db_path, object_sqlite_db_path,
-                args.k, args.max_images, llm, 
-                args.question_id
-            )
+            try:
+                search_results, saved_images = search_video(
+                    question, video, args.output_dir,
+                    object_faiss_db_path, event_faiss_db_path, object_sqlite_db_path,
+                    args.k, args.max_images, llm, 
+                    args.question_id
+                )
+            except Exception as e:
+                print(f"Error processing video {args.video_id}, question {args.question_id}: {e}")
 
 if __name__ == "__main__":
     main()

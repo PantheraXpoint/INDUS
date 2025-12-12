@@ -2,7 +2,8 @@ import cv2
 import numpy as np
 import os
 from typing import List, Dict, Tuple, Optional
-from FAISSDB import FAISSDB
+# FAISSDB import removed - not used, code uses MilvusDB instead
+# Use relative imports since this file is part of the embeddings package
 from Milvus import MilvusDB
 from SQLiteDB import SQLiteDB
 from JinaCLIP import JinaCLIP

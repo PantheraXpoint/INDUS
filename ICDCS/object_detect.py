@@ -15,7 +15,7 @@ from embeddings.FAISSDB import FAISSDB
 from embeddings.Milvus import MilvusDB
 from embeddings.SQLiteDB import SQLiteDB
 from JinaCLIP import JinaCLIP
-from AVA.tracker import CustomTracker
+from ICDCS.tracker import CustomTracker
 MAX_TRACKED_OBJECTS = 30
 
 

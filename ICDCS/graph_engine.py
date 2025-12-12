@@ -11,8 +11,8 @@ from .prompt import PROMPTS
 class GraphEngine:
     def __init__(self, 
                  knowledge_graph: KnowledgeGraphInterface, 
-                 context_graph: ContextGraphInterface, 
-                 scorer: GraphScorer,
+                 context_graph: Optional[ContextGraphInterface] = None, 
+                 scorer: Optional[GraphScorer] = None,
                  llm = None):  # LLM for query rewriting/keyword extraction
         self.kg = knowledge_graph
         self.context_graph = context_graph
@@ -604,10 +604,10 @@ class GraphEngine:
             self.current_keywords = f"{keywords_response}, {rewrite_entity_response}"
             
             # Compute keyword embedding for context storage/retrieval
-            self.current_context_key_embedding = self.kg.embedding_model.get_text_features(
-                [self.current_keywords]
-            )[0]
-            print(f"  📝 Context keywords: {self.current_keywords}")
+            # self.current_context_key_embedding = self.kg.embedding_model.get_text_features(
+            #     [self.current_keywords]
+            # )[0]
+            # print(f"  📝 Context keywords: {self.current_keywords}")
             
             # Search using keywords (text-based search)
             init_events = self.kg.search_events_by_description(keywords_response, top_k=5)
