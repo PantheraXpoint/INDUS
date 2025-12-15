@@ -22,8 +22,14 @@ def get_video_idx(dataset_name):
         raise ValueError(f"Dataset {dataset_name} not found in video_idx_zoo. Supported datasets: {supported_datasets}")
     return video_idx_zoo[dataset_name]
 
-def init_dataset(dataset_name):
+def init_dataset(dataset_name, video_path=None):
     if dataset_name not in dataset_zoo:
         supported_datasets = ", ".join(dataset_zoo.keys())
         raise ValueError(f"Dataset {dataset_name} not found in dataset_zoo. Supported datasets: {supported_datasets}")
-    return dataset_zoo[dataset_name]()
+    
+    # Handle different dataset initialization parameters
+    if dataset_name == "single_video":
+        return dataset_zoo[dataset_name](video_path=video_path)
+    else:
+        # For other datasets (lvbench, videomme, ava100), use default parameters
+        return dataset_zoo[dataset_name]()

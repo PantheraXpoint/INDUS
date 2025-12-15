@@ -31,12 +31,12 @@ from embeddings.JinaCLIP import JinaCLIP
 import os
 import json
 import copy
+import time
 from typing import Union
 from dataclasses import dataclass, field
 from typing import Type
 from llms.BaseModel import BaseVideoModel, BaseLanguageModel
 from video_utils import VideoRepresentation
-import time
 
 @dataclass
 class AVA:
@@ -56,7 +56,7 @@ class AVA:
     # video chunking
     video_chunk_duration: int = field(default=3) # seconds
     video_chunk_overlap: int = field(default=0) # seconds
-    video_chunk_num_frames: int = field(default=12) # seconds
+    video_chunk_num_frames: int = field(default=6) # seconds
     entity_extraction_num_frames: int = field(default=8)
     
     event_merge_algorithm: str = field(default="partition")
@@ -171,106 +171,156 @@ class AVA:
                 continue
             storage_inst.index_done_callback()
     
-    def query_tree_search(self, query: str, question_id: int = -1, re_process: bool = False):
-        start_time = time.time()
-        questions_folder = os.path.join(self.video.work_dir, "questions")
+    def query_tree_search(self, query: str, question_id: int, re_process: bool = False, retrieval_mode: str = "tri_view"):
+        # Start timing for query tree search
+        query_tree_search_start = time.time()
+        logger.info(f"STEP - Query Tree Search Start for question {question_id}")
+        
+        # Setup folder structure based on retrieval mode
+        folder_setup_start = time.time()
+        questions_folder_name = self._get_questions_folder_name(retrieval_mode)
+        questions_folder = os.path.join(self.video.work_dir, questions_folder_name)
         if not os.path.exists(questions_folder):
             os.makedirs(questions_folder)
-        if question_id != -1:
-            question_folder = os.path.join(questions_folder, f"{question_id}")
-        else:
-            question_folder = os.path.join(questions_folder, query)
+        question_folder = os.path.join(questions_folder, f"{question_id}")
         if not os.path.exists(question_folder):
             os.makedirs(question_folder)
+        folder_setup_end = time.time()
+        logger.info(f"TIMING - Folder Setup ({retrieval_mode}): {folder_setup_end - folder_setup_start:.4f} seconds")
             
         if not re_process and os.path.exists(os.path.join(question_folder, "tree_information.json")):
             logger.info(f"Tree information already exists for question {question_id}, skipping...")
+            logger.info(f"TIMING - Query Tree Search (cached): {time.time() - query_tree_search_start:.4f} seconds")
             return
         try:
             logger.info(f"Querying AVA with query: {query}")
-            tree_information = tree_search(query, self.llm_model, self.video, self.events_vdb, self.entities_vdb, self.features_vdb)
-            end_time = time.time()
-            print(f"Time taken for tree search: {end_time - start_time} seconds")
+            
+            # Tree search execution with specific retrieval mode
+            tree_search_execution_start = time.time()
+            tree_information = tree_search(query, self.llm_model, self.video, self.events_vdb, self.entities_vdb, self.features_vdb, retrieval_mode=retrieval_mode)
+            tree_search_execution_end = time.time()
+            logger.info(f"TIMING - Tree Search Execution ({retrieval_mode}): {tree_search_execution_end - tree_search_execution_start:.4f} seconds")
+            
+            # Save tree information
+            save_tree_info_start = time.time()
             with open(os.path.join(question_folder, "tree_information.json"), "w") as f:
                 json.dump(tree_information, f)
+            save_tree_info_end = time.time()
+            logger.info(f"TIMING - Save Tree Information: {save_tree_info_end - save_tree_info_start:.4f} seconds")
+            
         finally:
             pass
     
-    def generate_SA_answer(self, query: str, question_id: int = -1):
-        import time
-        start_time = time.time()
-        question_folder = os.path.join(self.video.work_dir, "questions")
-        if question_id != -1:
-            tree_information_file = os.path.join(question_folder, f"{question_id}", "tree_information.json")
-        else:
-            tree_information_file = os.path.join(question_folder, query, "tree_information.json")
+    def generate_SA_answer(self, query: str, question_id: int, retrieval_mode: str = "tri_view"):
+        # Start timing for SA answer generation
+        sa_answer_start = time.time()
+        logger.info(f"STEP - SA Answer Generation Start for question {question_id}")
+        
+        # Load tree information
+        load_tree_info_start = time.time()
+        questions_folder_name = self._get_questions_folder_name(retrieval_mode)
+        question_folder = os.path.join(self.video.work_dir, questions_folder_name)
+        tree_information_file = os.path.join(question_folder, f"{question_id}", "tree_information.json")
         with open(tree_information_file, "r") as f:
             tree_information = json.load(f)
+        load_tree_info_end = time.time()
+        logger.info(f"TIMING - Load Tree Information ({retrieval_mode}): {load_tree_info_end - load_tree_info_start:.4f} seconds")
             
-        # generate self-consistency resultn
-        if question_id != -1 and os.path.exists(os.path.join(question_folder, f"{question_id}", "SA_self_consistency_result.json")):
+        # generate self-consistency result
+        if os.path.exists(os.path.join(question_folder, f"{question_id}", "SA_self_consistency_result.json")):
+            load_self_consistency_start = time.time()
             with open(os.path.join(question_folder, f"{question_id}", "SA_self_consistency_result.json"), "r") as f:
                 cleaned_self_consistency_results = json.load(f)
+            load_self_consistency_end = time.time()
+            logger.info(f"TIMING - Load Cached Self-Consistency Results: {load_self_consistency_end - load_self_consistency_start:.4f} seconds")
         else:
             self_consistency_result = generate_sa_self_consistency_result(tree_information, self.llm_model)
+            
+            cleaning_start = time.time()
             cleaned_self_consistency_results = [
                 {k: v for k, v in item.items() if k not in {"structed_information", "input_prompt"}}
                 for item in self_consistency_result
             ]
+            cleaning_end = time.time()
+            logger.info(f"TIMING - Clean Self-Consistency Results: {cleaning_end - cleaning_start:.4f} seconds")
         
             # save self-consistency result
-            if question_id != -1:
-                with open(os.path.join(question_folder, f"{question_id}", "SA_self_consistency_result.json"), "w") as f:
-                    json.dump(cleaned_self_consistency_results, f, indent=4)
-            else:
-                with open(os.path.join(question_folder, "SA_self_consistency_result.json"), "w") as f:
-                    json.dump(cleaned_self_consistency_results, f, indent=4)
+            save_self_consistency_start = time.time()
+            with open(os.path.join(question_folder, f"{question_id}", "SA_self_consistency_result.json"), "w") as f:
+                json.dump(cleaned_self_consistency_results, f, indent=4)
+            save_self_consistency_end = time.time()
+            logger.info(f"TIMING - Save Self-Consistency Results: {save_self_consistency_end - save_self_consistency_start:.4f} seconds")
         
         # calculate sa nodes scores
         score_results = calculate_sa_score(copy.deepcopy(cleaned_self_consistency_results))
         
-        # cleaned_score_results = [
-        #     {k: v for k, v in item.items() if k not in {"responses"}}
-        #     for item in score_results
-        # ]
-        cleaned_score_results = score_results        
+        # Clean score results
+        clean_scores_start = time.time()
+        cleaned_score_results = [
+            {k: v for k, v in item.items() if k not in {"responses"}}
+            for item in score_results
+        ]
+        clean_scores_end = time.time()
+        logger.info(f"TIMING - Clean Score Results: {clean_scores_end - clean_scores_start:.4f} seconds")
         
         # save score results
-        if question_id != -1:
-            with open(os.path.join(question_folder, f"{question_id}", "SA_score_result.json"), "w") as f:
-                json.dump(cleaned_score_results, f, indent=4)
-        else:
-            with open(os.path.join(question_folder, "SA_score_result.json"), "w") as f:
-                json.dump(cleaned_score_results, f, indent=4)
+        save_scores_start = time.time()
+        with open(os.path.join(question_folder, f"{question_id}", "SA_score_result.json"), "w") as f:
+            json.dump(cleaned_score_results, f, indent=4)
+        save_scores_end = time.time()
+        logger.info(f"TIMING - Save Score Results: {save_scores_end - save_scores_start:.4f} seconds")
         
+        # Choose best answer
         sorted_score_results = choose_best_sa_answer(cleaned_score_results)
         
-        if question_id != -1:
-            with open(os.path.join(question_folder, f"{question_id}", "sorted_SA_score_result.json"), "w") as f:
-                json.dump(sorted_score_results, f, indent=4)
-        else:
-            with open(os.path.join(question_folder, "sorted_SA_score_result.json"), "w") as f:
-                json.dump(sorted_score_results, f, indent=4)
+        # Save sorted results
+        save_sorted_start = time.time()
+        with open(os.path.join(question_folder, f"{question_id}", "sorted_SA_score_result.json"), "w") as f:
+            json.dump(sorted_score_results, f, indent=4)
+        save_sorted_end = time.time()
+        logger.info(f"TIMING - Save Sorted Results: {save_sorted_end - save_sorted_start:.4f} seconds")
             
-        # final_sa_answer = list(sorted_score_results[0]["final_score"].keys())[0]
-        final_sa_answer = sorted_score_results[0]['responses'][0]
-        end_time = time.time()
-        print(f"Time taken: {end_time - start_time} seconds")
+        # Extract final answer
+        extract_answer_start = time.time()
+        final_sa_answer = list(sorted_score_results[0]["final_score"].keys())[0]
+        extract_answer_end = time.time()
+        logger.info(f"TIMING - Extract Final Answer: {extract_answer_end - extract_answer_start:.4f} seconds")
 
         return final_sa_answer
+
+    def _get_questions_folder_name(self, retrieval_mode: str) -> str:
+        """Get the appropriate questions folder name based on retrieval mode"""
+        folder_mapping = {
+            "tri_view": "questions",
+            "events_only": "questions_events_only", 
+            "entities_only": "questions_entities_only",
+            "features_only": "questions_features_only"
+        }
+        return folder_mapping.get(retrieval_mode, "questions")
     
-    def generate_CA_answer(self, query: str, question_id: int = -1):
+    def generate_CA_answer(self, query: str, question_id: int):
+        # Start timing for CA answer generation
+        ca_answer_start = time.time()
+        logger.info(f"STEP - CA Answer Generation Start for question {question_id}")
+        
+        # Load SA score result
+        load_sa_result_start = time.time()
         question_folder = os.path.join(self.video.work_dir, "questions")
         SA_score_result_file = os.path.join(question_folder, f"{question_id}", "sorted_SA_score_result.json")
         assert os.path.exists(SA_score_result_file), "SA score result file does not exist, please generate SA answer first!"
         
         with open(SA_score_result_file, "r") as f:
             SA_score_result = json.load(f)
+        load_sa_result_end = time.time()
+        logger.info(f"TIMING - Load SA Score Result: {load_sa_result_end - load_sa_result_start:.4f} seconds")
         
-        # generate self-consistency result
+        # Generate or load self-consistency result
         if os.path.exists(os.path.join(question_folder, f"{question_id}", "CA_self_consistency_result.json")):
+            load_ca_consistency_start = time.time()
             with open(os.path.join(question_folder, f"{question_id}", "CA_self_consistency_result.json"), "r") as f:
                 ca_self_consistency_result = json.load(f)
+            load_ca_consistency_end = time.time()
+            logger.info(f"TIMING - Load Cached CA Self-Consistency Results: {load_ca_consistency_end - load_ca_consistency_start:.4f} seconds")
         else:
             ca_self_consistency_result = generate_ca_self_consistency_result(
                 query=query,
@@ -282,28 +332,56 @@ class AVA:
                 max_retries=3,
             )
             
-            # save ca self-consistency result
+            # Save CA self-consistency result
+            save_ca_consistency_start = time.time()
             with open(os.path.join(question_folder, f"{question_id}", "CA_self_consistency_result.json"), "w") as f:
                 json.dump(ca_self_consistency_result, f, indent=4)
-            
-        # calculate ca nodes scores
-        score_results = calculate_ca_score(ca_self_consistency_result)
+            save_ca_consistency_end = time.time()
+            logger.info(f"TIMING - Save CA Self-Consistency Results: {save_ca_consistency_end - save_ca_consistency_start:.4f} seconds")
         
+        # Calculate CA nodes scores
+        ca_score_calc_start = time.time()
+        score_results = calculate_ca_score(ca_self_consistency_result)
+        ca_score_calc_end = time.time()
+        logger.info(f"TIMING - CA Score Calculation: {ca_score_calc_end - ca_score_calc_start:.4f} seconds")
+        
+        # Clean score results
+        clean_ca_scores_start = time.time()
         cleaned_score_results = [
             {k: v for k, v in item.items() if k not in {"responses"}}
             for item in score_results
         ]
+        clean_ca_scores_end = time.time()
+        logger.info(f"TIMING - Clean CA Score Results: {clean_ca_scores_end - clean_ca_scores_start:.4f} seconds")
         
-        # save score results
+        # Save score results
+        save_ca_scores_start = time.time()
         with open(os.path.join(question_folder, f"{question_id}", "CA_score_result.json"), "w") as f:
             json.dump(cleaned_score_results, f, indent=4)
-            
-        sorted_score_results = choose_best_ca_answer(cleaned_score_results)
+        save_ca_scores_end = time.time()
+        logger.info(f"TIMING - Save CA Score Results: {save_ca_scores_end - save_ca_scores_start:.4f} seconds")
         
+        # Choose best answer
+        choose_best_ca_start = time.time()
+        sorted_score_results = choose_best_ca_answer(cleaned_score_results)
+        choose_best_ca_end = time.time()
+        logger.info(f"TIMING - Choose Best CA Answer: {choose_best_ca_end - choose_best_ca_start:.4f} seconds")
+        
+        # Save sorted results
+        save_sorted_ca_start = time.time()
         with open(os.path.join(question_folder, f"{question_id}", "sorted_CA_score_result.json"), "w") as f:
             json.dump(sorted_score_results, f, indent=4)
-            
+        save_sorted_ca_end = time.time()
+        logger.info(f"TIMING - Save Sorted CA Results: {save_sorted_ca_end - save_sorted_ca_start:.4f} seconds")
+        
+        # Extract final answer
+        extract_ca_answer_start = time.time()
         final_ca_answer = list(sorted_score_results[0]["final_score"].keys())[0]
+        extract_ca_answer_end = time.time()
+        logger.info(f"TIMING - Extract Final CA Answer: {extract_ca_answer_end - extract_ca_answer_start:.4f} seconds")
+        
+        ca_answer_end = time.time()
+        logger.info(f"TIMING - CA Answer Generation Total: {ca_answer_end - ca_answer_start:.4f} seconds")
         
         return final_ca_answer
         
