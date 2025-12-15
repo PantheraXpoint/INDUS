@@ -42,6 +42,8 @@ class EventTracker:
         if self.embedding_model is not None:
             self.faiss_db = MilvusDB(faiss_db_path, self.embedding_model.embedding_dim)
 
+        self.buffer_descriptions = []
+
     def process_chunk(self, frames: list, frame_indices: list, detected_objects: list, video_chunk_num_frames: int, frame_skip: int):
         """
         Process a chunk of frames
@@ -53,6 +55,7 @@ class EventTracker:
                                                 frame_skip=frame_skip,
                                                 detected_objects=detected_objects)
         # TODO: add semantic chunking
+        self.buffer_descriptions.extend(descriptions)
         
         self._add_descriptions(descriptions)
 

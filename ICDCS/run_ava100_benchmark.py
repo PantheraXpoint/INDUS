@@ -327,18 +327,27 @@ class AVA100Benchmark:
             
             # Save iteration-by-iteration evaluation metrics
             iteration_metrics = engine.get_iteration_metrics()
+            iteration_log_path = output_subdir / "iteration_log.json"
+            log_data = {
+                'video_key': video_key,
+                'question_id': question_id,
+                'query': query,
+                'time_reference': time_reference,
+                'iterations': iteration_metrics
+            }
+            
+            # Always save the log, even if empty (to indicate evaluation was skipped)
+            with open(iteration_log_path, 'w') as f:
+                json.dump(log_data, f, indent=2)
+            
             if iteration_metrics:
-                iteration_log_path = output_subdir / "iteration_log.json"
-                log_data = {
-                    'video_key': video_key,
-                    'question_id': question_id,
-                    'query': query,
-                    'time_reference': time_reference,
-                    'iterations': iteration_metrics
-                }
-                with open(iteration_log_path, 'w') as f:
-                    json.dump(log_data, f, indent=2)
-                print(f"📈 Iteration evaluation log saved to: {iteration_log_path}")
+                print(f"📈 Iteration evaluation log saved to: {iteration_log_path} ({len(iteration_metrics)} iterations)")
+            else:
+                # Log was saved but empty - likely because time_reference was invalid
+                if time_reference and time_reference.strip() not in ["N/A", "", "None", "None-None"]:
+                    print(f"⚠️  Iteration log saved but empty (no iterations evaluated) to: {iteration_log_path}")
+                else:
+                    print(f"⚠️  Iteration log saved but empty (time_reference='{time_reference}' is invalid) to: {iteration_log_path}")
             
             # Compile results
             result = {

@@ -384,8 +384,8 @@ class GraphEngine:
             total_edges = sum(len(sg.edges) for sg in self.subgraphs)
             print(f"  Total graph size: {total_nodes} nodes, {total_edges} edges")
             
-            if total_nodes > 5000:
-                print(f"⚠️  Graph exceeded size limit ({total_nodes} > 10000 nodes). Stopping early.")
+            if total_nodes > 1000:
+                print(f"⚠️  Graph exceeded size limit ({total_nodes} > 1000 nodes). Stopping early.")
                 break
             
             # Process each subgraph with Shape-Aware Strategy
@@ -1692,6 +1692,7 @@ class GraphEngine:
             # Balance calculation
             if e_count == 0 or o_count == 0:
                 balance = 0.0
+                ratio = 0.0  # Default ratio when one count is zero
             else:
                 ratio = e_count / o_count
                 target_ratio = self.pruning_config['max_event_nodes'] / self.pruning_config['max_object_nodes']
