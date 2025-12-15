@@ -233,10 +233,12 @@ class KnowledgeGraphInterface:
             embedding = metadata.get('embedding', None)
             
             # STEP 2: SAFETY NET - If embedding missing, fetch it explicitly
+            # Note: MilvusDB.get_by_id() doesn't return embeddings, so we can't fetch them here
+            # Embeddings should be available from search results, otherwise they'll be None
             if embedding is None:
-                fetch_result = self.event_faiss_db.get_by_id(event_id, include_embedding=True)
-                if fetch_result:
-                    embedding = fetch_result.get('embedding', None)
+                # Try to get from get_by_id (though it won't have embedding)
+                fetch_result = self.event_faiss_db.get_by_id(event_id)
+                # Note: embedding will still be None since Milvus doesn't return it in query results
             
             # STEP 3: Convert to numpy array if needed
             if embedding is not None and not isinstance(embedding, np.ndarray):
@@ -273,12 +275,13 @@ class KnowledgeGraphInterface:
             embedding = metadata.get('embedding', None)
             
             # STEP 2: SAFETY NET - If embedding missing, fetch it explicitly
+            # Note: MilvusDB.query() doesn't return embeddings, so we can't fetch them here
+            # Embeddings should be available from search results, otherwise they'll be None
             if embedding is None:
                 try:
                     expr = f'track_id == {int(obj_id)}'
-                    fetch_results = self.object_faiss_db.query(expr, include_embedding=True)
-                    if fetch_results and len(fetch_results) > 0:
-                        embedding = fetch_results[0].get('embedding', None)
+                    fetch_results = self.object_faiss_db.query(expr)
+                    # Note: embedding will still be None since Milvus doesn't return it in query results
                 except:
                     pass  # Keep embedding as None if fetch fails
             
@@ -414,8 +417,9 @@ class KnowledgeGraphInterface:
         Fetch full event node with metadata by ID with GUARANTEED embedding.
         Normalizes event ID to base form (before underscore).
         """
-        # Query the event database (MUST request embedding explicitly!)
-        event_data = self.event_faiss_db.get_by_id(event_id, include_embedding=True)
+        # Query the event database
+        # Note: MilvusDB.get_by_id() doesn't return embeddings, only metadata
+        event_data = self.event_faiss_db.get_by_id(event_id)
         
         if not event_data:
             # Create minimal node if not found (no embedding available)
@@ -460,9 +464,10 @@ class KnowledgeGraphInterface:
         Fetch full object node with metadata by ID (track_id) with GUARANTEED embedding.
         """
         try:
-            # Query object database for this track_id (MUST request embedding explicitly!)
+            # Query object database for this track_id
+            # Note: MilvusDB.query() doesn't return embeddings, only metadata
             expr = f'track_id == {int(object_id)}'
-            results = self.object_faiss_db.query(expr, include_embedding=True)
+            results = self.object_faiss_db.query(expr)
             
             if not results:
                 # Create minimal node if not found (no embedding available)

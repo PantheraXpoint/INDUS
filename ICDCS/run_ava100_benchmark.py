@@ -16,22 +16,22 @@ import psutil
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from embeddings.JinaCLIP import JinaCLIP
-from embeddings.object_search import SearchSystem
 from llms.init_model import init_model
-from AVA.utils import tri_view_retrieval
-from AVA.graph_interfaces import KnowledgeGraphInterface, ContextGraphInterface
-from AVA.graph_scorer import GraphScorer
-from AVA.graph_engine import GraphEngine
-from AVA.export_subgraph import export_subgraph_to_json, export_all_subgraphs
+from ICDCS.graph_interfaces import KnowledgeGraphInterface, ContextGraphInterface
+from ICDCS.graph_scorer import GraphScorer
+from ICDCS.graph_engine import GraphEngine
+from ICDCS.export_subgraph import export_subgraph_to_json, export_all_subgraphs
 from pymilvus import connections
 
 
 class AVA100Benchmark:
     def __init__(self, base_data_dir="datas/AVA100", base_db_dir="database", output_dir="ava100_results", 
                  use_cache=True, memory_threshold_percent=80.0):
-        self.base_data_dir = Path(base_data_dir)
-        self.base_db_dir = Path(base_db_dir)
-        self.output_dir = Path(output_dir)
+        # Get project root directory (parent of ICDCS directory)
+        project_root = Path(__file__).parent.parent
+        self.base_data_dir = project_root / base_data_dir
+        self.base_db_dir = project_root / base_db_dir
+        self.output_dir = project_root / output_dir
         self.output_dir.mkdir(exist_ok=True)
         self.use_cache = use_cache
         self.memory_threshold = memory_threshold_percent
@@ -59,6 +59,8 @@ class AVA100Benchmark:
     def load_dataset_json(self, dataset_name):
         """Load JSON file for a specific dataset."""
         json_path = self.base_data_dir / f"{dataset_name}.json"
+        if not json_path.exists():
+            raise FileNotFoundError(f"Dataset file not found: {json_path}. Please check the path.")
         with open(json_path, 'r') as f:
             return json.load(f)
     
@@ -197,22 +199,7 @@ class AVA100Benchmark:
                 except:
                     pass
             
-            # Initialize search systems
-            object_search_system = SearchSystem(
-                db_paths['object_db'],
-                db_paths['sqlite_db'],
-                self.embedding_model
-            )
-            self.active_connection_aliases.append('milvus_object_embeddings')
-            
-            event_search_system = SearchSystem(
-                db_paths['event_db'],
-                None,
-                self.embedding_model
-            )
-            self.active_connection_aliases.append('milvus_event_embeddings')
-            
-            # Initialize graph components
+            # Initialize graph components (KnowledgeGraphInterface creates its own connections)
             self.current_kg = KnowledgeGraphInterface(
                 object_faiss_db_path=db_paths['object_db'],
                 event_faiss_db_path=db_paths['event_db'],
@@ -226,8 +213,8 @@ class AVA100Benchmark:
             #     db_path=f"database/{video_key}_context.db",
             #     embedding_dim=768
             # )
-            self.current_ctx = None
-            self.active_connection_aliases.append(f'milvus_{video_key}_context')
+            # self.current_ctx = None
+            # self.active_connection_aliases.append(f'milvus_{video_key}_context')
             
             self.current_scorer = GraphScorer()
             self.current_graph_engine = GraphEngine(
@@ -271,8 +258,9 @@ class AVA100Benchmark:
             # Run graph engine
             # Note: query_embedding parameter is kept for compatibility but not used internally
             query_embedding = self.embedding_model.get_text_features([query])[0]
+            time_reference = qa_data.get('time_reference', 'N/A')
             start_time = datetime.now()
-            answer, subgraphs = engine.search(query, query_embedding, max_iterations=max_iterations)
+            answer, subgraphs = engine.search(query, query_embedding, max_iterations=max_iterations, time_reference=time_reference)
             end_time = datetime.now()
             
             # Create output directory
@@ -329,6 +317,28 @@ class AVA100Benchmark:
                 print(f"\n✅ Best subgraph saved to: {best_path}")
                 print(f"   Nodes: {len(best_subgraph.nodes)}, Edges: {len(best_subgraph.edges)}")
                 print(f"   Query metadata included in JSON")
+            
+            # Save detailed cache statistics to file
+            cache_stats = engine._get_cache_statistics()
+            cache_stats_path = output_subdir / "cache_statistics.json"
+            with open(cache_stats_path, 'w') as f:
+                json.dump(cache_stats, f, indent=2)
+            print(f"📊 Cache statistics saved to: {cache_stats_path}")
+            
+            # Save iteration-by-iteration evaluation metrics
+            iteration_metrics = engine.get_iteration_metrics()
+            if iteration_metrics:
+                iteration_log_path = output_subdir / "iteration_log.json"
+                log_data = {
+                    'video_key': video_key,
+                    'question_id': question_id,
+                    'query': query,
+                    'time_reference': time_reference,
+                    'iterations': iteration_metrics
+                }
+                with open(iteration_log_path, 'w') as f:
+                    json.dump(log_data, f, indent=2)
+                print(f"📈 Iteration evaluation log saved to: {iteration_log_path}")
             
             # Compile results
             result = {

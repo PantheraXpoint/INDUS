@@ -9,7 +9,7 @@ import json
 from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from AVA.graph_interfaces import Subgraph, Node, Edge
+from ICDCS.graph_interfaces import Subgraph, Node, Edge
 from typing import List, Dict
 
 

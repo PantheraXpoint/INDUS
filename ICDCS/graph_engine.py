@@ -1,12 +1,77 @@
 import numpy as np
 import math
 import json
-from typing import List, Dict, Set, Optional, Tuple, Deque
+import hashlib
+import sys
+import os
+from typing import List, Dict, Set, Optional, Tuple, Deque, Any
 from collections import deque, defaultdict
 import networkx as nx
 from graph_interfaces import Node, Edge, Subgraph, KnowledgeGraphInterface, ContextGraphInterface, get_global_system_counts
 from graph_scorer import GraphScorer
-from .prompt import PROMPTS
+from AVA.prompt import PROMPTS
+
+# Import evaluation functions from time_ref.py
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    from time_ref import time_to_seconds, percentage_overlap, overlap_reference_helper
+except ImportError:
+    # Fallback: define locally if import fails
+    def time_to_seconds(time_str: str):
+        if len(time_str.split(":")) == 2:
+            minutes, seconds = time_str.split(":")
+            return int(minutes) * 60 + int(seconds)
+        elif len(time_str.split(":")) == 3:
+            hours, minutes, seconds = time_str.split(":")
+            return int(hours) * 3600 + int(minutes) * 60 + int(seconds)
+        else:
+            raise ValueError(f"Invalid time string: {time_str}")
+    
+    def percentage_overlap(time_list: List[Tuple[int, int]], time_ref: Tuple[int, int]) -> float:
+        ref_start, ref_end = time_ref
+        if ref_end < ref_start:
+            return 0.0
+        if ref_start == ref_end:
+            point = ref_start
+            for start, end in time_list:
+                if end <= start:
+                    continue
+                if start <= point < end:
+                    return 1.0
+            return 0.0
+        ref_length = ref_end - ref_start
+        total_covered = 0
+        for start, end in time_list:
+            if end <= start:
+                continue
+            s = max(start, ref_start)
+            e = min(end, ref_end)
+            if e > s:
+                total_covered += (e - s)
+        return total_covered / ref_length if ref_length > 0 else 0.0
+    
+    def overlap_reference_helper(time_ref: str, time_list: List[Tuple[int, int]]):
+        if time_ref == "N/A" or time_ref == "" or time_ref == "None" or time_ref == "None-None":
+            return None
+        if "-" in time_ref:
+            start_time, end_time = time_ref.split("-")
+            if start_time in ["", "None"]:
+                start_time = end_time
+            if end_time in ["", "None"]:
+                end_time = start_time
+            start_time_seconds = time_to_seconds(start_time)
+            end_time_seconds = time_to_seconds(end_time)
+        elif "," in time_ref:
+            points_overlap = []
+            points = time_ref.split(",")
+            for point in points:
+                point = point.strip()
+                points_overlap.append(percentage_overlap(time_list, (time_to_seconds(point), time_to_seconds(point))))
+            return sum(points_overlap) / len(points_overlap)
+        else:
+            start_time_seconds = time_to_seconds(time_ref)
+            end_time_seconds = start_time_seconds
+        return percentage_overlap(time_list, (start_time_seconds, end_time_seconds))
 
 class GraphEngine:
     def __init__(self, 
@@ -18,25 +83,58 @@ class GraphEngine:
         self.context_graph = context_graph
         self.scorer = scorer
         self.llm = llm
-        self.subgraphs: List[Subgraph] = []
         
-        # Session State
-        self.current_context_key_embedding: Optional[np.ndarray] = None  # Keyword embedding for context
-        self.current_keywords: str = ""  # Comma-separated keywords from LLM
+        # === PER-QUERY STATE (reset each search) ===
+        self.subgraphs: List[Subgraph] = []
+        self.current_context_key_embedding: Optional[np.ndarray] = None
+        self.current_keywords: str = ""
         self.retrieved_context_subgraphs: List[Subgraph] = []
+        self.current_iteration: int = 0
+        self.iteration_metrics: List[Dict] = []  # Store evaluation metrics per iteration
+        
+        # === PER-VIDEO CACHES (persist across queries) ===
+        # KG Query Cache
+        self._kg_query_cache = {
+            'objects_in_event': {},      # event_id → List[str] (object IDs)
+            'events_with_object': {},    # object_id → List[str] (event IDs)
+            'event_count_per_object': {} # object_id → int
+        }
+        
+        # Vector Search Cache (hybrid: node-based + embedding-based)
+        self._vector_search_cache = {
+            'event_to_event_by_node': {},     # event_id → List[Node]
+            'object_to_object_by_node': {},   # object_id → List[Node]
+            'event_by_embedding': {},         # hash(embedding) → List[Node]
+            'object_by_embedding': {},        # hash(embedding) → List[Node]
+        }
+        
+        # === CACHE STATISTICS ===
+        self._cache_stats = {
+            'kg_queries': {
+                'objects_in_event': {'hits': 0, 'misses': 0},
+                'events_with_object': {'hits': 0, 'misses': 0},
+                'event_count_per_object': {'hits': 0, 'misses': 0}
+            },
+            'vector_searches': {
+                'event_to_event': {'hits': 0, 'misses': 0},
+                'object_to_object': {'hits': 0, 'misses': 0},
+                'event_by_embedding': {'hits': 0, 'misses': 0},
+                'object_by_embedding': {'hits': 0, 'misses': 0}
+            }
+        }
 
         # Pruning Configuration
         self.pruning_config = {
             # RANK-BASED BUDGETS (Score-Saturation Proof)
             # These define how many TOP nodes to keep (regardless of scores)
-            'max_event_nodes': 15,          # Keep TOP 50 events (excl. seeds)
-            'max_object_nodes': 35,        # Keep TOP 100 objects (excl. seeds)
-            'max_edges': 150,               # Edge count threshold for pruning trigger
-            'max_total_nodes': 70,         # Total node threshold for pruning trigger
+            'max_event_nodes': 100,          # Keep TOP 50 events (excl. seeds)
+            'max_object_nodes': 200,        # Keep TOP 100 objects (excl. seeds)
+            'max_edges': 700,               # Edge count threshold for pruning trigger
+            'max_total_nodes': 350,         # Total node threshold for pruning trigger
             
             # Saturation detection (when to trigger pruning)
             'score_saturation_threshold': 0.95,
-            'saturation_count_trigger': 10,
+            'saturation_count_trigger': 100,
             
             # Steiner tree settings (bridge protection)
             'use_articulation_points': True,    # Find critical connection points
@@ -45,7 +143,208 @@ class GraphEngine:
             'max_path_length': 3,               # Max path length for bridge detection
         }
 
-    def search(self, query: str, query_embedding: np.ndarray, max_iterations: int = 10):
+    def _reset_query_state(self):
+        """Reset per-query state (called at start of each search)."""
+        self.subgraphs = []
+        self.retrieved_context_subgraphs = []
+        self.current_context_key_embedding = None
+        self.current_keywords = ""
+        self.current_iteration = 0
+        self.iteration_metrics = []
+    
+    def _embedding_to_key(self, embedding: np.ndarray) -> str:
+        """Convert embedding to cache key using fast hash."""
+        return hashlib.md5(embedding.tobytes()).hexdigest()
+    
+    def _get_cache_statistics(self) -> Dict:
+        """Generate detailed cache statistics."""
+        stats = {
+            'kg_queries': {},
+            'vector_searches': {},
+            'summary': {}
+        }
+        
+        # KG Query Stats
+        for op_type, counts in self._cache_stats['kg_queries'].items():
+            total = counts['hits'] + counts['misses']
+            if total > 0:
+                hit_rate = counts['hits'] / total * 100
+                stats['kg_queries'][op_type] = {
+                    'hits': counts['hits'],
+                    'misses': counts['misses'],
+                    'total': total,
+                    'hit_rate': hit_rate
+                }
+        
+        # Vector Search Stats
+        for op_type, counts in self._cache_stats['vector_searches'].items():
+            total = counts['hits'] + counts['misses']
+            if total > 0:
+                hit_rate = counts['hits'] / total * 100
+                stats['vector_searches'][op_type] = {
+                    'hits': counts['hits'],
+                    'misses': counts['misses'],
+                    'total': total,
+                    'hit_rate': hit_rate
+                }
+        
+        # Overall Summary
+        kg_total_hits = sum(c['hits'] for c in self._cache_stats['kg_queries'].values())
+        kg_total_misses = sum(c['misses'] for c in self._cache_stats['kg_queries'].values())
+        kg_total = kg_total_hits + kg_total_misses
+        
+        vec_total_hits = sum(c['hits'] for c in self._cache_stats['vector_searches'].values())
+        vec_total_misses = sum(c['misses'] for c in self._cache_stats['vector_searches'].values())
+        vec_total = vec_total_hits + vec_total_misses
+        
+        stats['summary'] = {
+            'kg_queries': {
+                'total_hits': kg_total_hits,
+                'total_misses': kg_total_misses,
+                'total': kg_total,
+                'hit_rate': (kg_total_hits / kg_total * 100) if kg_total > 0 else 0
+            },
+            'vector_searches': {
+                'total_hits': vec_total_hits,
+                'total_misses': vec_total_misses,
+                'total': vec_total,
+                'hit_rate': (vec_total_hits / vec_total * 100) if vec_total > 0 else 0
+            }
+        }
+        
+        return stats
+    
+    def get_iteration_metrics(self) -> List[Dict]:
+        """
+        Get evaluation metrics for all iterations.
+        
+        Returns:
+            List of iteration evaluation results
+        """
+        return self.iteration_metrics
+
+    def _subgraph_to_evaluation_format(self, subgraph: Subgraph) -> Dict[str, Any]:
+        """
+        Convert a Subgraph object to the format expected by overlap_reference.
+        
+        Returns:
+            Dictionary with 'nodes' list, where each event node has:
+            - type: "event"
+            - metadata: {"start_time": int, "end_time": int} (in frames)
+        """
+        nodes_list = []
+        for node in subgraph.nodes.values():
+            if node.type == 'event':
+                # Extract start_time and end_time from metadata (in frames)
+                start_time = node.metadata.get('start_time', 0)
+                end_time = node.metadata.get('end_time', 0)
+                
+                nodes_list.append({
+                    'type': 'event',
+                    'metadata': {
+                        'start_time': start_time,
+                        'end_time': end_time
+                    }
+                })
+        
+        return {'nodes': nodes_list}
+    
+    def _evaluate_subgraphs(self, time_reference: str) -> List[Dict]:
+        """
+        Evaluate overlap for each subgraph separately.
+        
+        Args:
+            time_reference: Time reference string (e.g., "1:23-2:45" or "1:23")
+        
+        Returns:
+            List of evaluation results, one per subgraph:
+            [
+                {
+                    'subgraph_id': str,
+                    'overlap': float or None,
+                    'num_nodes': int,
+                    'num_events': int,
+                    'num_objects': int,
+                    'num_edges': int
+                },
+                ...
+            ]
+        """
+        results = []
+        
+        for subgraph in self.subgraphs:
+            # Extract time list from event nodes (convert frames to seconds)
+            time_list = []
+            events = subgraph.get_nodes_by_type('event')
+            for event_node in events:
+                # Extract start_time and end_time from metadata (in frames)
+                start_time_frames = event_node.metadata.get('start_time', 0)
+                end_time_frames = event_node.metadata.get('end_time', 0)
+                
+                # Convert frames to seconds (divide by 30, matching time_ref.py logic)
+                start_time_seconds = start_time_frames // 30
+                end_time_seconds = end_time_frames // 30
+                
+                if start_time_seconds >= 0 and end_time_seconds > start_time_seconds:
+                    time_list.append((start_time_seconds, end_time_seconds))
+            
+            # Evaluate overlap
+            overlap = overlap_reference_helper(time_reference, time_list)
+            
+            # Collect statistics
+            objects = subgraph.get_nodes_by_type('object')
+            
+            results.append({
+                'subgraph_id': subgraph.id,
+                'overlap': overlap,
+                'num_nodes': len(subgraph.nodes),
+                'num_events': len(events),
+                'num_objects': len(objects),
+                'num_edges': len(subgraph.edges)
+            })
+        
+        return results
+    
+    def _log_iteration_evaluation(self, iteration_label: str, time_reference: str):
+        """
+        Evaluate all subgraphs and store results in iteration_metrics.
+        
+        Args:
+            iteration_label: Label for this evaluation (e.g., "iteration_0_seeds", "iteration_1")
+            time_reference: Time reference string from QA data
+        """
+        if not time_reference or time_reference.strip() in ["N/A", "", "None", "None-None"]:
+            # No time reference available, skip evaluation
+            return
+        
+        # Evaluate all subgraphs
+        subgraph_results = self._evaluate_subgraphs(time_reference.strip())
+        
+        # Store in iteration_metrics
+        iteration_data = {
+            'iteration': iteration_label,
+            'num_subgraphs': len(self.subgraphs),
+            'subgraphs': subgraph_results
+        }
+        
+        self.iteration_metrics.append(iteration_data)
+        
+        # Print summary
+        if subgraph_results:
+            overlaps = [r['overlap'] for r in subgraph_results if r['overlap'] is not None]
+            if overlaps:
+                avg_overlap = sum(overlaps) / len(overlaps)
+                max_overlap = max(overlaps)
+                print(f"  📊 {iteration_label}: {len(subgraph_results)} subgraphs evaluated")
+                print(f"     Average overlap: {avg_overlap:.3f}, Max overlap: {max_overlap:.3f}")
+                for i, result in enumerate(subgraph_results):
+                    if result['overlap'] is not None:
+                        print(f"     Subgraph {i+1} ({result['subgraph_id']}): overlap={result['overlap']:.3f}, "
+                              f"{result['num_events']}E/{result['num_objects']}O/{result['num_nodes']}N")
+            else:
+                print(f"  📊 {iteration_label}: {len(subgraph_results)} subgraphs (no valid overlaps)")
+
+    def search(self, query: str, query_embedding: np.ndarray, max_iterations: int = 15, time_reference: Optional[str] = None):
         """
         Run graph search for the given query.
         
@@ -53,16 +352,23 @@ class GraphEngine:
             query: Natural language query text
             query_embedding: Query embedding (kept for signature compatibility, but not used internally)
             max_iterations: Maximum exploration iterations
+            time_reference: Optional time reference string for evaluation (e.g., "1:23-2:45")
         
         Note: query_embedding parameter is kept for backward compatibility but is not used.
               The search uses keyword embeddings extracted via LLM instead.
         """
         print(f"--- Starting Search: '{query}' ---")
-        self.current_iteration = 0  # Track iteration for progressive pruning
+        
+        # Reset per-query state (fix for subgraph accumulation bug)
+        self._reset_query_state()
         
         # 1. Initialization (Create Anchor Subgraphs with intelligent grouping)
         self._initial_exploration(query)
         print(f"Initialized with {len(self.subgraphs)} subgraphs")
+        
+        # Evaluate after seed initialization
+        if time_reference:
+            self._log_iteration_evaluation("iteration_0_seeds", time_reference)
         
         # State tracking for convergence detection (subgraph count stability)
         graph_size_history = []  # Tracks number of subgraphs per iteration
@@ -142,6 +448,10 @@ class GraphEngine:
             # Adaptive pruning (check if any subgraph needs pruning)
             self._adaptive_pruning()
             
+            # Evaluate after this iteration
+            if time_reference:
+                self._log_iteration_evaluation(f"iteration_{self.current_iteration}", time_reference)
+            
             # === CONVERGENCE CHECK: Subgraph Stability ===
             # Measure current system state by subgraph count
             current_subgraph_count = len(self.subgraphs)
@@ -162,11 +472,15 @@ class GraphEngine:
         print(f"\n--- Post-Processing: Cross-Subgraph Finalization ---")
         self._finalize_all_subgraphs()
         
+        # Evaluate after post-processing (final state)
+        if time_reference:
+            self._log_iteration_evaluation("iteration_final_after_postprocessing", time_reference)
+        
         # 4. Final Aggregation
         answer, final_subgraphs = self._aggregation(query)
         
         # 5. Save best subgraph to context for future queries
-        if self.current_context_key_embedding is not None and self.subgraphs:
+        if self.context_graph is not None and self.current_context_key_embedding is not None and self.subgraphs:
             best_subgraphs = self.select_best_subgraphs(top_k=1, max_total_nodes_budget=999999)
             if best_subgraphs:
                 best_subgraph = best_subgraphs[0]
@@ -176,6 +490,16 @@ class GraphEngine:
                     best_subgraph,
                     keywords=self.current_keywords
                 )
+        
+        # 6. Log cache statistics summary
+        cache_stats = self._get_cache_statistics()
+        if cache_stats['summary']['kg_queries']['total'] > 0:
+            print(f"\n📊 Cache Summary:")
+            print(f"   KG Queries: {cache_stats['summary']['kg_queries']['hit_rate']:.1f}% hit rate "
+                  f"({cache_stats['summary']['kg_queries']['total_hits']}/{cache_stats['summary']['kg_queries']['total']})")
+        if cache_stats['summary']['vector_searches']['total'] > 0:
+            print(f"   Vector Searches: {cache_stats['summary']['vector_searches']['hit_rate']:.1f}% hit rate "
+                  f"({cache_stats['summary']['vector_searches']['total_hits']}/{cache_stats['summary']['vector_searches']['total']})")
         
         return answer, final_subgraphs
 
@@ -269,7 +593,15 @@ class GraphEngine:
     # Operations
     # ------------------------------------------------------------------
     def _op_event_to_object(self, source: Node, subgraph: Subgraph, strategy_mode: str = 'BALANCED'):
-        kg_ids = set(self.kg.get_objects_in_event(source.id))
+        # Check KG cache first
+        if source.id in self._kg_query_cache['objects_in_event']:
+            kg_ids = set(self._kg_query_cache['objects_in_event'][source.id])
+            self._cache_stats['kg_queries']['objects_in_event']['hits'] += 1
+        else:
+            kg_ids = set(self.kg.get_objects_in_event(source.id))
+            self._kg_query_cache['objects_in_event'][source.id] = list(kg_ids)
+            self._cache_stats['kg_queries']['objects_in_event']['misses'] += 1
+        
         ctx_ids = self._get_context_neighbors(source.id, 'event_to_object')
         obj_ids = kg_ids.union(ctx_ids)
         
@@ -293,8 +625,23 @@ class GraphEngine:
         #     print(f"  [EVENT_TO_OBJECT] Event {source.id} → Added {added_count}/{len(obj_ids)} objects (strategy={strategy_mode})")
 
     def _op_object_to_event(self, source: Node, subgraph: Subgraph, strategy_mode: str = 'BALANCED'):
-        kg_ids = set(self.kg.get_events_containing_object(source.id))
-        global_count = self.kg.get_global_event_count_for_object(source.id)
+        # Check KG cache for events containing this object
+        if source.id in self._kg_query_cache['events_with_object']:
+            kg_ids = set(self._kg_query_cache['events_with_object'][source.id])
+            self._cache_stats['kg_queries']['events_with_object']['hits'] += 1
+        else:
+            kg_ids = set(self.kg.get_events_containing_object(source.id))
+            self._kg_query_cache['events_with_object'][source.id] = list(kg_ids)
+            self._cache_stats['kg_queries']['events_with_object']['misses'] += 1
+        
+        # Check KG cache for global count
+        if source.id in self._kg_query_cache['event_count_per_object']:
+            global_count = self._kg_query_cache['event_count_per_object'][source.id]
+            self._cache_stats['kg_queries']['event_count_per_object']['hits'] += 1
+        else:
+            global_count = self.kg.get_global_event_count_for_object(source.id)
+            self._kg_query_cache['event_count_per_object'][source.id] = global_count
+            self._cache_stats['kg_queries']['event_count_per_object']['misses'] += 1
         
         if len(kg_ids) == 0:
             print(f"  [OBJECT_TO_EVENT] Object {source.id} appears in no events")
@@ -341,11 +688,20 @@ class GraphEngine:
             self._update_or_create_node(tid, 'event', energy, subgraph, source, 'context_event_to_event')
 
     def _op_vector_object_to_object(self, source: Node, subgraph: Subgraph, strategy_mode: str = 'BALANCED'):
-        # if source.embedding is None:
-        #     print(f"  [VECTOR_OBJECT] BLOCKED: Object {source.id} has no embedding (Lobotomy Bug!)")
-        #     return
+        # Validate embedding before vector search
+        if not self._is_valid_embedding(source.embedding):
+            # Skip vector search if embedding is invalid
+            return
         
-        results = self.kg.search_objects_by_embedding(source.embedding, top_k=5)
+        # Check vector search cache (node-based fast path)
+        if source.id in self._vector_search_cache['object_to_object_by_node']:
+            results = self._vector_search_cache['object_to_object_by_node'][source.id]
+            self._cache_stats['vector_searches']['object_to_object']['hits'] += 1
+        else:
+            results = self.kg.search_objects_by_embedding(source.embedding, top_k=5)
+            self._vector_search_cache['object_to_object_by_node'][source.id] = results
+            self._cache_stats['vector_searches']['object_to_object']['misses'] += 1
+        
         # print(f"  [VECTOR_OBJECT] Object {source.id} → Found {len(results)} similar objects (strategy={strategy_mode})")
         
         added_count = 0
@@ -363,12 +719,30 @@ class GraphEngine:
         # if added_count > 0:
         #     print(f"  [VECTOR_OBJECT] ✓ Added {added_count}/{len(results)} new object links")
 
+    def _is_valid_embedding(self, embedding) -> bool:
+        """Check if embedding is valid (not None and no NaN values)."""
+        if embedding is None:
+            return False
+        if isinstance(embedding, np.ndarray):
+            if np.any(np.isnan(embedding)) or np.any(np.isinf(embedding)):
+                return False
+        return True
+
     def _op_vector_event_to_event(self, source: Node, subgraph: Subgraph, strategy_mode: str = 'BALANCED'):
-        # if source.embedding is None:
-        #     print(f"  [VECTOR_EVENT] BLOCKED: Event {source.id} has no embedding (Lobotomy Bug!)")
-        #     return
+        # Validate embedding before vector search
+        if not self._is_valid_embedding(source.embedding):
+            # Skip vector search if embedding is invalid
+            return
         
-        results = self.kg.search_events_by_embedding(source.embedding, top_k=5)
+        # Check vector search cache (node-based fast path)
+        if source.id in self._vector_search_cache['event_to_event_by_node']:
+            results = self._vector_search_cache['event_to_event_by_node'][source.id]
+            self._cache_stats['vector_searches']['event_to_event']['hits'] += 1
+        else:
+            results = self.kg.search_events_by_embedding(source.embedding, top_k=5)
+            self._vector_search_cache['event_to_event_by_node'][source.id] = results
+            self._cache_stats['vector_searches']['event_to_event']['misses'] += 1
+        
         # print(f"  [VECTOR_EVENT] Event {source.id} → Found {len(results)} similar events (strategy={strategy_mode})")
         
         added_count = 0
@@ -610,8 +984,8 @@ class GraphEngine:
             # print(f"  📝 Context keywords: {self.current_keywords}")
             
             # Search using keywords (text-based search)
-            init_events = self.kg.search_events_by_description(keywords_response, top_k=5)
-            init_objects = self.kg.search_objects_by_description(rewrite_entity_response, top_k=5)
+            init_events = self.kg.search_events_by_description(keywords_response, top_k=45)
+            init_objects = self.kg.search_objects_by_description(rewrite_entity_response, top_k=45)
         else:
             # Fallback: Use raw query text directly (no keyword extraction)
             print("⚠️  LLM not available, using direct query text for search")
@@ -656,7 +1030,7 @@ class GraphEngine:
 
         # Retrieve context subgraphs from previous queries as REFERENCES (not active subgraphs)
         # Use KEYWORD embedding (not raw query embedding)
-        if self.current_context_key_embedding is not None:
+        if self.context_graph is not None and self.current_context_key_embedding is not None:
             self.retrieved_context_subgraphs = self.context_graph.search_context(
                 self.current_context_key_embedding, top_k=3
             )
@@ -668,7 +1042,10 @@ class GraphEngine:
             for ctx_sg in self.retrieved_context_subgraphs:
                 print(f"  - Context '{ctx_sg.id}': {len(ctx_sg.nodes)} nodes, {len(ctx_sg.edges)} edges")
         else:
-            print("No context subgraphs retrieved (first query or no matches)")
+            if self.context_graph is None:
+                print("📂 Context graph disabled - no cross-query memory")
+            else:
+                print("📂 No context subgraphs retrieved (first query or no matches)")
 
     def _group_connected_seeds(self, init_events: List[Node], init_objects: List[Node]) -> Tuple[List[Tuple[List[Node], List[Node]]], Dict[str, Set[str]]]:
         """
