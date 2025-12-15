@@ -176,6 +176,7 @@ cython_debug/
 .pypirc
 
 # AVA cache
+AVA_cache
 AVA_cache/
 
 # video data
