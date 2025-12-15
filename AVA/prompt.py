@@ -103,6 +103,23 @@ Question: {input_text}
 Output: 
 """
 
+PROMPTS["time_extraction"] = """
+You are an expert time parser for video event descriptions.
+
+Given an input description, extract the time information it refers to.
+
+Return the result as a Python list of two floats (in seconds):
+- If the text contains a time range (e.g. "from 00:12.5 to 00:18.7" or "12.5s–18.7s"), return [12, 18], rounded to integer.
+- If it contains a single time point (e.g. "at 00:15" or "15 seconds"), return [15, 15], rounded to integer.
+- If there is no time information at all, return None.
+
+Only output the final Python object — no explanations, no quotes.
+
+Input: {input_text}
+
+Output:
+"""
+
 PROMPTS["query_rewrite_for_entity_retrieval"] = """
 - Goal -
 For a given query, generate a declarative sentence to serve as a query for retrieving relevant knowledge, concentrating on the main entities and relevant descriptions.
@@ -403,4 +420,248 @@ Input: {inputs}
 Output Format:
 The final output should be a concise, fact-based summary of the traffic activity with the following format:
 [Timestamp]: [Consolidated Summary of Traffic Elements (vehicle types, quantities, characteristics, actions, pedestrian activity, traffic anomalies)].
+"""
+
+PROMPTS["filter_description"] = """
+You are an expert in video scene understanding and grounding natural language to tracked objects.
+
+You are given four inputs:
+1) Query: a short phrase describing what the user is asking about (e.g., "the woman", "the person walking", "the baby").
+2) Description: a full free-text scene description.
+3) Tracks: a JSON list of tracked objects, each with:
+   - track_id (int)
+   - class (string, e.g., "person", "car", "dog")
+   - boxes: a list of detections for that track across time, each item having:
+       * frame_number (int), with the corresponding frame number in the given frames sequence.
+       * bbox [x_min, y_min, x_max, y_max] in pixel coordinates (top-left, bottom-right), this is normalized to 1000x1000 pixels.
+4) Frames: a list of images where all detected or tracked objects are already annotated with bounding boxes labeled as ID: <number>” and their class name (e.g., ID: 1, person”).
+
+### Your task:
+- Identify which track_id(s) best match the Query by aligning the Description to the Tracks.
+- Only select track IDs that exist in the provided Tracks input.
+
+### Matching guidance (apply pragmatically; do NOT explain these rules in the output):
+- **Class compatibility:** Prefer tracks whose `class` matches the Query (e.g., "man/woman/person" → class "person"; "car/vehicle" → class "car"/"truck", etc.). Use reasonable synonyms/singular/plural mapping.
+- **Action & motion cues:** If the Description/Query mentions actions (e.g., walking, running, sitting, opening, carrying), infer from temporal bbox patterns (movement vs. static size/position changes) and prefer tracks whose motion plausibly fits.
+- **Spatial cues (left/right/center/front/back/near/far):** Approximate from bbox center x,y and area across frames. (Left = smaller x; right = larger x; center = mid-range; near = larger area; far = smaller area.)
+- **Temporal cues:** If the Description mentions entering/exiting/approaching/stopping, use the sequence of boxes to favor tracks that appear accordingly (e.g., moving from edge inward).
+- **Quantity cues:** If Query implies multiple entities ("two people"), return multiple track_ids that best satisfy count + other cues.
+- **Salience:** When ambiguous, favor tracks with longer visibility, clearer motion consistent with the Query, and better class match.
+- **No hallucination:** Never invent track IDs; only choose from Tracks. If nothing fits, return an empty list.
+
+### Output format constraints:
+- Output **only** valid JSON with this exact structure.
+- Do **not** include any explanations, commentary, examples, or Markdown fences.
+- Output must begin with {{ and end with }} — nothing else.
+- `track_ids` must be a JSON array of integers.
+- `final_answer` must be a single concise sentence identifying the best-matching object(s).
+- `analysis` must be a brief rationale (1–2 sentences) for why those track IDs match.
+
+### Inputs:
+Query: {query}
+Description: {description}
+Tracks (JSON): {tracks_json}
+
+### Output (strict JSON only):
+{{ 
+  "track_ids": [matching track ids], 
+  "final_answer": "<concise answer describing the relevant object(s)>", 
+  "analysis": "<brief reasoning explaining why these track ids match the query>" }}
+
+"""
+
+PROMPTS["visual_filter_description"] = """
+You are an expert in visual scene understanding and object grounding.
+
+You are given:
+1) Query: a short natural language phrase describing what the user is asking about (e.g., "the man in blue", "the car on the right").
+2) Image: a single image where all detected or tracked objects are already annotated with bounding boxes labeled as ID: <number>” and their class name (e.g., ID: 1, person”).
+3) Description: a free-text summary describing the visual scene context.
+
+### Your task:
+- Identify which **track_id(s)** in the image best match the Query, using both the visual information and the contextual description.
+- You can directly “see” the boxes and labels drawn on the image — use them as visual anchors.
+
+### Matching guidance (apply visually; do NOT explain these in output):
+- **Class match:** Align nouns in the Query (e.g., person, car, dog) to the labeled class near each ID”.
+- **Appearance cues:** Use visible properties such as clothing color, object color, or shape.
+- **Spatial cues:** Infer left/right/center/top/bottom/near/far from bounding box placement and size.
+- **Interaction cues:** If the Query or Description mentions actions or relations (“the person holding the cup”, “the car next to the bike”), visually match based on proximity or orientation.
+- **Multiplicity cues:** If multiple entities are requested (“two people”), return multiple relevant track IDs.
+- **Confidence:** When uncertain, favor the most visually salient or contextually consistent candidate.
+- **No guessing:** Only output track IDs visible and labeled on the image.
+
+### Output format constraints:
+- Output **only** valid JSON in the following exact structure.
+- Do NOT include explanations, Markdown, or extra text.
+- Output must begin with {{ and end with }}.
+- `track_ids` must be an array of integers.
+- `final_answer` should be a short, direct identification of the chosen object(s).
+- `analysis` should be a brief rationale (1–2 sentences) summarizing the visual reasoning.
+
+### Inputs:
+Query: {query}
+Description: {description}
+Image: (contains bounding boxes labeled like ID: 1, person”, ID: 2, car”, etc.)
+
+### Output (strict JSON only):
+{{ 
+  "track_ids": [matching track ids], 
+  "final_answer": "<concise answer describing the identified object(s)>", 
+  "analysis": "<brief reasoning based on visible cues and context>" 
+}}
+"""
+
+PROMPTS["summary_and_answer_augmented"] = """
+You are an expert in video scene understanding and grounding natural language to tracked objects.
+
+You are given four inputs:
+1) Query: a short phrase describing what the user is asking about (e.g., "the woman", "the person walking", "the baby").
+2) Description: a full free-text scene description.
+3) Tracks: a JSON list of tracked objects, each with:
+   - track_id (int)
+   - class (string, e.g., "person", "car", "dog")
+   - boxes: a list of detections for that track across time, each item having:
+       * frame_number (int), with the corresponding frame number in the given frames sequence.
+       * bbox [x_min, y_min, x_max, y_max] in pixel coordinates (top-left, bottom-right), this is normalized to 1000x1000 pixels.
+4) Frames: a list of images where all detected or tracked objects are already annotated with bounding boxes labeled as ID: <number>” and their class name (e.g., ID: 1, person”).
+
+### Your task:
+- Identify which track_id(s) best match the Query by aligning the Description to the Tracks.
+- Only select track IDs that exist in the provided Tracks input.
+- Based on your analysis, choose the best matching track(s) and provide the corresponding multiple-choice answer (A, B, C, or D).
+
+### Matching guidance (apply pragmatically; do NOT explain these rules in the output):
+- **Class compatibility:** Prefer tracks whose `class` matches the Query (e.g., "man/woman/person" → class "person"; "car/vehicle" → class "car"/"truck", etc.). Use reasonable synonyms/singular/plural mapping.
+- **Action & motion cues:** If the Description/Query mentions actions (e.g., walking, running, sitting, opening, carrying), infer from temporal bbox patterns (movement vs. static size/position changes) and prefer tracks whose motion plausibly fits.
+- **Spatial cues (left/right/center/front/back/near/far):** Approximate from bbox center x,y and area across frames. (Left = smaller x; right = larger x; center = mid-range; near = larger area; far = smaller area.)
+- **Temporal cues:** If the Description mentions entering/exiting/approaching/stopping, use the sequence of boxes to favor tracks that appear accordingly (e.g., moving from edge inward).
+- **Quantity cues:** If Query implies multiple entities ("two people"), return multiple track_ids that best satisfy count + other cues.
+- **Salience:** When ambiguous, favor tracks with longer visibility, clearer motion consistent with the Query, and better class match.
+- **No hallucination:** Never invent track IDs; only choose from Tracks. If nothing fits, return an empty list.
+
+### Output format:
+Return your review, reference, and reasoning process in the `Analysis` field and the answer in the `Answer` field. Choose one of the following options based on your analysis:
+- A) [First option]
+- B) [Second option]
+- C) [Third option]
+- D) [Fourth option]
+
+### Inputs:
+Query: {query}
+Description: {description}
+Tracks (JSON): {tracks_json}
+
+### Output (strict JSON only):
+{{ 
+  "Analysis": "<Brief reasoning about how the tracks match the query based on class, action, motion, etc.>", 
+  "Answer": "[A, B, C, or D]" 
+}}
+"""
+
+PROMPTS["generate_event_to_event_description"] = """
+You are an expert in video understanding and temporal event analysis. Your task is to analyze video frames from two connected events and generate a detailed description of how these events are related to each other.
+
+### Context:
+You are provided with:
+1. **User Query**: The question or task that requires understanding the relationship between events.
+2. **Event Pair Information**: Details about two events that are connected in a knowledge graph:
+   - Event 1: description, frame range, and metadata
+   - Event 2: description, frame range, and metadata
+   - Connection score: a numerical value indicating the strength of the connection
+3. **Video Frames**: A sequence of frames extracted from both events, showing the visual progression from Event 1 to Event 2.
+
+### Your Task:
+Analyze the provided video frames and generate a comprehensive description that explains:
+1. **Visual Progression**: How the scene transitions from Event 1 to Event 2, including:
+   - Changes in objects, people, or entities
+   - Spatial movements or transformations
+   - Temporal continuity or gaps
+   
+2. **Causal or Sequential Relationships**: Identify if Event 1 causes, enables, or leads to Event 2, or if they are part of a larger sequence.
+
+3. **Key Visual Connections**: Describe specific visual elements that link the two events:
+   - Recurring objects or people
+   - Environmental continuity
+   - Action sequences or movements
+
+4. **Relevance to Query**: Explain how this event-to-event connection relates to the user's query.
+
+### Guidelines:
+- Focus on **observable visual evidence** from the frames. Do not speculate beyond what is visible.
+- Describe the **temporal flow** between events clearly.
+- Highlight **distinctive visual markers** that connect the events.
+- Keep the description concise but comprehensive (approximately 150-250 words).
+- If the frames show a clear cause-effect relationship, make it explicit.
+- If the connection is weak or unclear, state this honestly.
+
+### Input:
+User Query: {user_query}
+
+Event Pair Information:
+{event_pair_info}
+
+### Output Format:
+Provide your analysis in JSON format:
+{{
+  "event_connection_description": "<Detailed description of how Event 1 and Event 2 are visually and temporally connected, including progression, relationships, and relevance to the query>",
+  "connection_type": "<Type of connection: causal, sequential, simultaneous, or unclear>",
+  "visual_evidence": "<Key visual elements that support the connection>",
+  "relevance_to_query": "<How this connection helps answer the user query>"
+}}
+"""
+
+PROMPTS["generate_final_answer_with_e2e"] = """
+You are an advanced AI system designed to answer questions based on video content and knowledge graph information. You will receive:
+1. A user query/question
+2. Knowledge graph information including events, objects, and their relationships
+3. Event-to-event connection descriptions generated from visual analysis of video frames
+
+Your task is to synthesize all this information to provide a comprehensive and accurate answer to the user's query.
+
+### Instructions:
+1. **Review the User Query**: Carefully understand what the user is asking about.
+
+2. **Analyze Knowledge Graph Information**: Review the provided events, objects, and their relationships. Pay attention to:
+   - Event descriptions and their temporal information
+   - Objects associated with each event
+   - The overall structure and statistics of the knowledge graph
+
+3. **Integrate Event-to-Event Connections**: The event-to-event descriptions were generated by analyzing video frames. These descriptions provide:
+   - Visual evidence of how events are connected
+   - Temporal progression between events
+   - Causal or sequential relationships
+   - Relevance indicators to the query
+   
+   Use these descriptions to understand the deeper relationships between events that may not be fully captured in the graph structure alone.
+
+4. **Synthesize Information**: Combine information from:
+   - The knowledge graph (structured events and objects)
+   - The event-to-event visual analysis (temporal and causal connections)
+   - Your understanding of the query requirements
+   
+   To form a coherent answer.
+
+5. **Provide Reasoning**: Explain your reasoning process, including:
+   - Which events and objects are most relevant to the query
+   - How the event-to-event connections inform your answer
+   - Any temporal or causal relationships that are important
+
+6. **Generate Answer**: Provide a clear, direct answer to the user's query based on your analysis.
+
+### Input:
+User Query: {user_query}
+
+Knowledge Graph Information:
+{video_segments}
+
+Event-to-Event Connection Descriptions:
+{event_to_event_descriptions}
+
+### Output Format:
+Respond in clean JSON format:
+{{
+  "Analysis": "<Your detailed reasoning process, explaining how you integrated the knowledge graph information and event-to-event connections to answer the query. Include references to specific events, objects, and connections that are relevant.>",
+  "Answer": "A" // Or "B", or "C", or "D". Just the single capital letter.
+}}
 """

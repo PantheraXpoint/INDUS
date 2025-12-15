@@ -23,7 +23,6 @@ if __name__ == "__main__":
     else:
         video = dataset.get_video()
     
-    start_time = time.time()
     ava = AVA(
         video=video,
         llm_model=llm,

@@ -11,10 +11,12 @@ from PIL import Image
 # Add embeddings directory to path
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'embeddings'))
 
-# from embeddings.FAISSDB import FAISSDB
+from embeddings.FAISSDB import FAISSDB
+from embeddings.Milvus import MilvusDB
 from embeddings.SQLiteDB import SQLiteDB
 from JinaCLIP import JinaCLIP
-from AVA.tracker import CustomTracker
+from ICDCS.tracker import CustomTracker
+MAX_TRACKED_OBJECTS = 30
 
 
 class ObjectDetectorTracker:
@@ -25,7 +27,7 @@ class ObjectDetectorTracker:
     def __init__(self, model_path: str = "yolo11n.pt", conf_threshold: float = 0.5, 
                  iou_threshold: float = 0.5, tracker_config: str = "config/tracker.yaml",
                  embedding_model: Optional[JinaCLIP] = None, faiss_db_path: str = "embeddings.faiss",
-                 sqlite_db_path: str = "tracked_objects.db"):
+                 sqlite_db_path: str = "tracked_objects.db", use_persistent_sqlite: bool = False):
         """
         Initialize the object detector and tracker
         
@@ -37,6 +39,8 @@ class ObjectDetectorTracker:
             embedding_model: JinaCLIP embedding model for generating embeddings
             faiss_db_path: Path to FAISS database
             sqlite_db_path: Path to SQLite database
+            use_persistent_sqlite: If True, use persistent SQLite connection (faster but uses more resources).
+                                   If False, use per-request connections (lighter, better for vLLM)
         """
         self.model = YOLO(model_path)
         self.conf_threshold = conf_threshold
@@ -51,12 +55,13 @@ class ObjectDetectorTracker:
         self.sqlite_db = None
         
         if self.embedding_model is not None:
-            self.faiss_db = FAISSDB(faiss_db_path, self.embedding_model.embedding_dim)
+            self.faiss_db = MilvusDB(faiss_db_path, self.embedding_model.embedding_dim)
             self.sqlite_db = SQLiteDB(sqlite_db_path)
         
         # Colors for visualization (BGR format)
         self.colors = self._generate_colors(80)  # COCO dataset has 80 classes
-        self.all_tracked_objects = {}  # Store tracked objects with history
+        self.batch_embedding = []
+        
         
     def _generate_colors(self, num_classes: int) -> List[Tuple[int, int, int]]:
         """Generate distinct colors for each class"""
@@ -213,27 +218,6 @@ class ObjectDetectorTracker:
                 # Detect and track objects
                 tracked_objects = self.detect_and_track(frame)
                 
-                # Store tracked objects for this frame
-                for tracked_object in tracked_objects:
-                    track_id = tracked_object["track_id"]
-                    bbox = [int(coord) for coord in tracked_object["bbox"]]
-                    confidence = tracked_object["confidence"]
-                    track_id_exists = track_id in self.all_tracked_objects
-                    if not track_id_exists:
-                        print(f"New track ID: {tracked_object}")
-                        self.all_tracked_objects[track_id] = {
-                            "class_id": tracked_object["class_id"],
-                            "class_name": tracked_object["class_name"],
-                            "bbox_history": [bbox],
-                            "confidence_history": [confidence],
-                            "frame_numbers": [frame_count]
-                        }
-                    else:
-                        # Append to existing track
-                        self.all_tracked_objects[track_id]["bbox_history"].append(bbox)
-                        self.all_tracked_objects[track_id]["confidence_history"].append(confidence)
-                        self.all_tracked_objects[track_id]["frame_numbers"].append(frame_count)
-                
                 processed_frame_count += 1
                 
                 if visualize:
@@ -289,6 +273,25 @@ class ObjectDetectorTracker:
 
         return all_tracked_objects
     
+    def process_frame(self, frame: np.ndarray, frame_count: int, event_id: int = None, detected_objects: List = None):
+        # Detect and track objects
+        tracked_objects = self.detect_and_track(frame)
+        
+        # Store tracked objects with history
+        for tracked_object in tracked_objects:
+            tracked_object["event_id"] = event_id
+            tracked_object["frame_numbers"] = frame_count
+
+            existing = self._add_tracked_object(tracked_object)
+            if not existing:
+                self._generate_embedding(frame, tracked_object)
+            if str(tracked_object['track_id']) not in detected_objects:
+                detected_objects.append(str(tracked_object['track_id']))
+
+        # vis_frame = self.visualize_results(frame, tracked_objects)
+        # cv2.imwrite(f"debug/tracked_objects_{frame_count}.jpg", vis_frame)
+        return detected_objects
+
     def process_video_tracking_only(self, video_path: str) -> List[List[Dict]]:
         """
         Process a video file for object detection and tracking without saving video or visualization
@@ -336,32 +339,8 @@ class ObjectDetectorTracker:
             
             # Only process every frame_skip frames for 10fps processing
             if frame_count % frame_skip == 0:
-                # Detect and track objects
-                tracked_objects = self.detect_and_track(frame)
                 
-                # Store tracked objects with history
-                for tracked_object in tracked_objects:
-                    track_id = tracked_object["track_id"]
-                    bbox = [int(coord) for coord in tracked_object["bbox"]]
-                    confidence = tracked_object["confidence"]
-                    track_id_exists = track_id in self.all_tracked_objects
-                    if not track_id_exists:
-                        self.all_tracked_objects[track_id] = {
-                            "class_id": tracked_object["class_id"],
-                            "class_name": tracked_object["class_name"],
-                            "bbox_history": [bbox],
-                            "confidence_history": [confidence],
-                            "frame_numbers": [frame_count]
-                        }
-                        # Generate embedding for new track and add to FAISS database
-                        self._generate_embedding(frame, bbox, track_id, frame_count, confidence, tracked_object)
-                    else:
-                        # Append to existing track
-                        self.all_tracked_objects[track_id]["bbox_history"].append(bbox)
-                        self.all_tracked_objects[track_id]["confidence_history"].append(confidence)
-                        self.all_tracked_objects[track_id]["frame_numbers"].append(frame_count)
-                    # Add tracked object to SQLite database
-                    self._add_tracked_object(tracked_object)
+                self.process_frame(frame, frame_count)
                 
                 processed_frame_count += 1
                 
@@ -376,33 +355,31 @@ class ObjectDetectorTracker:
         
         elapsed_time = time.time() - start_time
         processing_avg_fps = processed_frame_count / elapsed_time
-        total_objects = len(self.all_tracked_objects)
         
         print(f"Processing complete!")
         print(f"Total input frames: {frame_count}")
         print(f"Processed frames: {processed_frame_count}")
         print(f"Processing speed: {processing_avg_fps:.1f} FPS")
-        print(f"Total tracked objects: {total_objects}")
-
-        return self.all_tracked_objects
     
     def _add_tracked_object(self, tracked_object: Dict):
         """
         Add tracked object to SQLite database - only insert new or update existing
         """
         if self.sqlite_db is not None:
-            track_id = tracked_object["track_id"]
-            obj_data = self.all_tracked_objects[track_id]
-            self.sqlite_db.add_tracked_object(
-                track_id=track_id,
+            obj_data = tracked_object
+            existing = self.sqlite_db.add_tracked_object(
+                track_id=obj_data["track_id"],
                 class_id=obj_data["class_id"],
                 class_name=obj_data["class_name"],
-                bbox_history=obj_data["bbox_history"],
-                confidence_history=obj_data["confidence_history"],
-                frame_numbers=obj_data["frame_numbers"]
+                bbox_history=[int(x) for x in obj_data["bbox"]],
+                confidence_history=obj_data["confidence"],
+                frame_numbers=obj_data["frame_numbers"],
+                event_id=obj_data["event_id"]
             )
+            return existing
+        return False
     
-    def _generate_embedding(self, frame: np.ndarray, bbox: List[int], track_id: int, frame_count: int, confidence: float, tracked_object: Dict):
+    def _generate_embedding(self, frame: np.ndarray, tracked_object: Dict):
         """
         Generate embedding for a bounding box in the frame
         """
@@ -411,7 +388,7 @@ class ObjectDetectorTracker:
             try:
                 # Extract ROI from frame
                 height, width = frame.shape[:2]  # OpenCV uses (height, width) format
-                x1, y1, x2, y2 = map(int, bbox)
+                x1, y1, x2, y2 = map(int, tracked_object['bbox'])
                 x1 = max(0, min(x1, width-1))
                 y1 = max(0, min(y1, height-1))
                 x2 = max(x1+1, min(x2, width))
@@ -421,63 +398,37 @@ class ObjectDetectorTracker:
                 
                 if roi.size > 0:
                     # Convert BGR to RGB for JinaCLIP
-                    roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
-                    
+                    # roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+                    roi_rgb = roi
                     # Generate embedding
                     roi_pil = Image.fromarray(roi_rgb)
-                    embedding = self.embedding_model.get_image_features([roi_pil])[0]
 
+                    id = str(tracked_object["track_id"])
                     # Store in FAISS database
                     metadata = {
-                        'frame_number': frame_count,
-                        'bbox': bbox,
-                        'confidence': confidence,
+                        'track_id': tracked_object["track_id"],
+                        'frame_number': tracked_object["frame_numbers"],
+                        'bbox': tracked_object["bbox"],
+                        'confidence': tracked_object["confidence"],
                         'class_id': tracked_object["class_id"],
-                        'class_name': tracked_object["class_name"]
+                        'class_name': tracked_object["class_name"],
+                        'event_id': tracked_object["event_id"],
                     }
-                    faiss_id = self.faiss_db.add_embedding(embedding, track_id, metadata)
-                    print(f"Generated embedding for new track {track_id} (FAISS ID: {faiss_id})")
+                    self.batch_embedding.append((roi_pil, id, metadata))
+                    if len(self.batch_embedding) == 64:
+                        roi_pils, ids, metadatas = zip(*self.batch_embedding)    
+                        embeddings = self.embedding_model.get_image_features(roi_pils)
+                        self.batch_embedding = []
+                        for embedding, id, metadata in zip(embeddings, ids, metadatas):
+                            faiss_id = self.faiss_db.add_embedding(embedding, id, metadata)
                     
             except Exception as e:
-                print(f"Error generating embedding for track {track_id}: {e}")
-    
-    def process_image(self, image_path: str, output_path: str) -> None:
-        """
-        Process a single image for object detection and tracking
-        
-        Args:
-            image_path: Path to input image
-            output_path: Path to save output image
-        """
-        # Read image
-        frame = cv2.imread(image_path)
-        if frame is None:
-            print(f"Error: Could not open image file {image_path}")
-            return
-        
-        print(f"Processing image: {image_path}")
-        
-        # Detect and track objects
-        tracked_objects = self.detect_and_track(frame)
-        
-        # Visualize results
-        vis_frame = self.visualize_results(frame, tracked_objects)
-        
-        # Add info text
-        info_text = f"Objects: {len(tracked_objects)}"
-        cv2.putText(vis_frame, info_text, (10, 30), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        
-        # Save output image
-        cv2.imwrite(output_path, vis_frame)
-        print(f"Output image saved to: {output_path}")
-        print(f"Detected {len(tracked_objects)} objects")
-
+                print(f"Error generating embedding for tracks {ids}: {e}")
 
 def main():
     """Main function for testing the ObjectDetectorTracker"""
     parser = argparse.ArgumentParser(description='Object Detection and Tracking with YOLOv11')
-    parser.add_argument('--model', type=str, default='yolo11n.pt', 
+    parser.add_argument('--model', type=str, default='checkpoints/yolo11l.pt', 
                        help='Path to YOLO model weights')
     parser.add_argument('--conf', type=float, default=0.5, 
                        help='Confidence threshold')
@@ -497,9 +448,9 @@ def main():
                        help='Process video for tracking only (no output video)')
     parser.add_argument('--enable-embeddings', action='store_true',
                        help='Enable embedding generation for new track IDs')
-    parser.add_argument('--faiss-db', type=str, default='embeddings.faiss',
+    parser.add_argument('--faiss-db', type=str, default='database/object_embeddings.faiss',
                        help='Path to FAISS database file')
-    parser.add_argument('--sqlite-db', type=str, default='tracked_objects.db',
+    parser.add_argument('--sqlite-db', type=str, default='database/tracked_objects.db',
                        help='Path to SQLite database file')
     
     args = parser.parse_args()

@@ -5,11 +5,6 @@ import subprocess
 from panns_inference import AudioTagging
 import json
 
-# ==== MODEL SETUP ====
-device = "cuda" if torch.cuda.is_available() else "cpu"
-at = AudioTagging(checkpoint_path=None, device=device)  # CNN14 pretrained
-labels = at.labels  # 527 AudioSet class names
-
 # ==== AUDIO EXTRACTION ====
 def extract_audio_from_mp4(mp4_path, wav_path="temp_audio.wav"):
     """
@@ -72,6 +67,10 @@ def predict_audio_chunks(file_path, target_labels=["cry", "thud"], chunk_sec=3, 
     return results
 
 if __name__ == "__main__":
+    # ==== MODEL SETUP ====
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    at = AudioTagging(checkpoint_path=None, device=device)  # CNN14 pretrained
+    labels = at.labels  # 527 AudioSet class names
     # ==== DEMO USAGE ====
     mp4_file = "../Project-AVAS/datas/single_video/child_fall_1.mp4"
     wav_file = extract_audio_from_mp4(mp4_file)

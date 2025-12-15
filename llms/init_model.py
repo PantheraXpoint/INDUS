@@ -2,12 +2,14 @@ from llms.QwenLM import QwenLM
 from llms.QwenVL import QwenVL
 from llms.Gemini import Gemini
 from llms.FastVLM import FastVLM
+from llms.QwenVL_vllm import QwenVL_vllm
 
 model_zoo = {
     "qwenlm": QwenLM,
     "qwenvl": QwenVL,
     "gemini": Gemini,
-    "fastvlm": FastVLM
+    "fastvlm": FastVLM,
+    "qwenvl_vllm": QwenVL_vllm
 }
 
 def init_model(model_name, num_gpus=1):

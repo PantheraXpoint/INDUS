@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=0 python query_SA.py --model qwenvl --dataset lvbench --video_id -1 --gpus 1

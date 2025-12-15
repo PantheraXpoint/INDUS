@@ -8,11 +8,11 @@ import os
 API_KEY = os.getenv("GEMINI_API_KEY")
 
 class Gemini(BaseVideoModel, BaseLanguageModel):
-    def __init__(self, model_type="gemini-1.5-flash", tp=None):
+    def __init__(self, model_type="gemini-2.5-flash", tp=None):
         self.model_type = model_type
         self.key = API_KEY
 
-    def generate_response(self, inputs, max_new_tokens=500, temperature=0.5):
+    def generate_response(self, inputs, max_new_tokens=8192, temperature=0.5):
         assert "text" in inputs.keys(), "Please provide a text prompt."
         
         model = OpenAI(
@@ -46,16 +46,16 @@ class Gemini(BaseVideoModel, BaseLanguageModel):
 
         return response.choices[0].message.content
 
-    async def generate_response_async(self, inputs, max_new_tokens=500, temperature=0.5):
+    async def generate_response_async(self, inputs, max_new_tokens=8192, temperature=0.5):
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self.generate_response, inputs, max_new_tokens, temperature)
 
-    async def _generate_batch_response(self, batch_inputs, max_new_tokens=500, temperature=0.5):
+    async def _generate_batch_response(self, batch_inputs, max_new_tokens=8192, temperature=0.5):
         tasks = [self.generate_response_async(inputs, max_new_tokens, temperature) for inputs in batch_inputs]
         responses = await asyncio.gather(*tasks)
         return responses
 
-    def batch_generate_response(self, batch_inputs, max_new_tokens=500, max_batch_size=16, temperature=0.5):
+    def batch_generate_response(self, batch_inputs, max_new_tokens=8192, max_batch_size=16, temperature=0.5):
         return asyncio.run(self._generate_batch_response(batch_inputs, max_new_tokens, temperature))
 
 

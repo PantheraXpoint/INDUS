@@ -1,171 +1,352 @@
-# Project-Ava
-An implementation of Paper "Empowering Agentic Video Analytics Systems with Video Language Models"
-> 📰 **Paper:**  [Arxiv](https://arxiv.org/abs/2505.00254)
+# Project AVAS - Advanced Video Analysis and Search System
 
-## 📰 News
-- **[2025/08/01]** Gemini-1.5-Pro has been officially deprecated. We recommend everyone to try the more powerful Gemini-2.5-Pro. You can apply for the API [here](https://aistudio.google.com/apikey).
-- **[2025/06/27]** We have released the AVA-100 dataset on [Hugging Face](https://huggingface.co/datasets/iesc/Ava-100).
+A comprehensive embedding-based video analysis system that combines object detection, tracking, event recognition, and semantic search capabilities using state-of-the-art AI models.
 
-## 🔧 Key Features
-- **Task Definition**: Define five levels of intelligence (L1–L5) for current and future video analysis systems. AVA is the first L4 video analytics system powered by VLMs, enabling open-ended comprehension, reasoning, and analytics—marking a significant advancement.
-- **Near-real-time index construction**: AVA employs Event-Knowledge Graphs (EKGs) to construct video index, supporting near real-time indexing even on common edge devices (2 $\times$ RTX 4090).
-- **Agentic retrieval and generation**: AVA uses LLM as an agent to proactively explore and retrieve additional event information related to prior results, enabling multi-path reasoning and response generation based on aggregated data.
-- **Proposed benchmark**: Proposes AVA-100, an ultra-long video benchmark designed to evaluate video analysis capabilities, comprising 8 videos (each over 10 hours) and 120 manually annotated questions across four scenarios: human daily activities, city walking, wildlife surveillance, and traffic monitoring.
-- AVA achieves $62.3\%$ on LVBench, $62.3\%$ on VideoMME-Long, and $75.8\%$ on the proposed AVA-100 benchmark, outperforming mainstream VLMs and Video-RAG methods under the same settings.
+## Overview
 
-![Overall performance](./arts/results.jpg)
+Project AVAS (Advanced Video Analysis and Search) provides intelligent video understanding through:
+- **Object Detection & Tracking**: YOLOv11-based detection with persistent tracking
+- **Embedding Generation**: Semantic embeddings using JinaCLIP for similarity search
+- **Event Recognition**: LLM-powered event description and tracking
+- **Natural Language Search**: Query videos using text descriptions to find specific objects or events
+- **Multi-Database Storage**: FAISS for fast similarity search and SQLite for detailed metadata
 
----
-## 📹 AVA-100
-AVA-100 is proposed by us, which is an ultra-long video
-benchmark specially designed to evaluate video analysis
-capabilities Avas-100 consists of 8 videos, each exceeding
-10 hours in length, and includes a total of 120 manually
-annotated questions. The benchmark covers four typical
-video analytics scenarios: human daily activities, city walking, wildlife surveillance, and traffic monitoring, each scenario contains two videos.  All questions are carefully
-designed by human annotators, who also provide reference
-answers as the ground truth. In addition, GPT-4o is utilized
-to generate plausible distractor options.
-- **Human daily activities**: Selected and stitched from egocentric footage in the [Ego4D](https://ego4d-data.org/).
-- **City walking**: Selected from publicly available YouTube videos, capturing urban exploration.
-- **Wildlife surveillance**: Selected from publicly available YouTube videos, capturing animal monitoring.
-- **Traffic monitoring**: Selected and stitched from monitoring videos in the [Bellevue Traffic Video Dataset](https://github.com/City-of-Bellevue/TrafficVideoDataset).
+## Key Features
 
-![AVA-100 real case](./arts/ava100.jpg)
+### 🎯 Object Detection & Tracking
+- Real-time object detection using YOLOv11
+- Persistent multi-object tracking across frames
+- Automatic embedding generation for tracked objects
+- Processing at 10 FPS for efficient tracking
 
----
-## 📦 Installation
+### 🔍 Semantic Search
+- Text-based object search using natural language descriptions
+- Event-level search with contextual understanding
+- Tri-view retrieval combining object and event embeddings
+- Frame-range filtering for temporal queries
+
+### 🤖 Event Recognition
+- LLM-powered event description generation
+- Chunk-based video analysis at 3 FPS
+- Contextual event understanding with object relationships
+- Event-level embedding storage for semantic search
+
+### 💾 Database Systems
+- **FAISS Database**: Fast similarity search for embeddings
+- **SQLite Database**: Detailed tracking metadata (frames, bboxes, confidence)
+- Automatic database management per video
+
+## Installation
+
+### Prerequisites
+- Python 3.8+
+- CUDA-capable GPU (recommended for FAISS-GPU and model inference)
+
+### Install Dependencies
+
 ```bash
-git clone https://github.com/I-ESC/Project-AVA.git
-cd Project-AVA
-conda create -n ava python=3.9
-conda activate ava
 pip install -r requirements.txt
 ```
 
----
-## Dataset Preparation
-In our project, the dataset is organized as follows:
+**Note**: For better performance, install `faiss-gpu` if you have CUDA:
 ```bash
-datas/
-└── [dataset_name]/
-    ├── videos/     # folder stores raw videos
-    ├── *.json.     # raw videos information and question-answers
-    └── download.sh # quick download script 
+pip install faiss-gpu
 ```
 
-We recommend using the provided script to download the dataset:
+### Download Model Checkpoints
+
+Ensure you have the YOLO model checkpoints in the `checkpoints/` directory:
+- `checkpoints/yolo11l.pt` (default)
+- `checkpoints/yolo11n.pt` (optional, lighter model)
+
+## Quick Start
+
+### 1. Process a Video
+
+Process a video to generate embeddings and tracking data:
+
 ```bash
-# supported dataset: LVBench, VideoMME, AVA100
-cd datas/[dataset-name]
-./download.sh
+python main_embedding_tracking.py \
+    --video path/to/your/video.mp4 \
+    --process-only \
+    --model qwenvl
 ```
 
-## Video Preprocessing
-Since the videos processed in this project are relatively long, we choose to preprocess them into frames and store them on disk, instead of dynamically loading them into memory for each operation. This method improves processing speed and is more friendly to hardware resources. Additionally, to speed up the processing, we employ parallel processing techniques:
+This will:
+- Detect and track objects in the video
+- Generate embeddings for all tracked objects
+- Generate event descriptions using LLM
+- Store data in `database/<video_name>/` directory
+
+### 2. Search for Objects
+
+Search for specific objects or events in a processed video:
+
 ```bash
-python preprocess_videos.py --dataset [lvbench/videomme/ava100] --num_threads 10 # Set num_threads based on your hardware capabilities.
+python main_embedding_tracking.py \
+    --video path/to/your/video.mp4 \
+    --description "a person wearing a red shirt" \
+    --output-dir extracted_objects \
+    --k 5 \
+    --max-images 10 \
+    --model qwenvl
 ```
-All intermediate results in our project are organized under the **AVA_cache** folder. After processing the video frames, you should see the following files:
+
+This will:
+- Parse your natural language query
+- Search both object and event embeddings
+- Filter and rank results using LLM
+- Extract bounding box images from matching objects
+
+### 3. View Database Statistics
+
+Get statistics about tracked objects in a processed video:
+
 ```bash
-AVA_cache/
-└── LVBench/
-    ├── 1                # video id
-        ├── frames       # folder stores raw frames
-        ├── config.json  # video's raw info, including resolution, duration, and so on.
-        ├── ...
-    ├── 2
-    ├── ...
-
-└── VideoMME/
-    ├── 601
-    ├── 602
-    ├── ...
-
-└── AVA100/
-    ├── 1
-    ├── 2
-    ├── ...
-
+python main_embedding_tracking.py \
+    --video path/to/your/video.mp4 \
+    --stats
 ```
 
----
-## Graph Construction
-Construct event knowledge graph for the video:
+## Usage Examples
+
+### Example 1: Process and Search
 ```bash
-# View llms.init_model.py for supported models
-# View dataset.init_dataset.py for supported dataset
-# View datas/[dataset_name]/[dataset_name.json] for video_id, LVBench: 1-103, VideoMME: 601-900, AVA-100: 1-8
-python graph_construction.py --model [name_of_model] --dataset [name_of_dataset] --video_id [id_of_video] --gpus [num_of_gpus]
+# Step 1: Process the video
+python main_embedding_tracking.py --video sample.mp4 --process-only
+
+# Step 2: Search for objects
+python main_embedding_tracking.py \
+    --video sample.mp4 \
+    --description "a person with blue shirt" \
+    --k 10
 ```
-Constructing the graph is a time-consuming process. For example, building a graph for a 10-hour video can take 3–5 hours (the actual time depends on the hardware used). Therefore, we recommend directly downloading our pre-built graphs from [here](https://drive.google.com/drive/folders/1g4Zmc8vsly3TofkIcj-n8Z1M0KsX9qox?usp=drive_link) and merging them into the **AVA_cache** folder. After this, the folder structure should be as follows:
+
+### Example 2: Complex Query Search
 ```bash
-AVA_cache/
-└── LVBench/
-    ├── 1                
-        ├── frames       
-        ├── config.json  
-        ├── kg
-            ├── vdb_events.json
-            ├── vdb_entities.json
-            ├── vdb_relations.json
-            ├── graph_event_knowledge_graph.graphml
-            ├── ...
-
-    ├── 2
-    ├── ...
+# Search with natural language query
+python main_embedding_tracking.py \
+    --video sample.mp4 \
+    --description "find a child playing in the playground" \
+    --output-dir results \
+    --max-images 5
 ```
 
-## Generate Summary_and_Answer Result
-You can generate answers to questions about a specific video in the following way:
+### Example 3: Custom Model
 ```bash
-# View datas/[dataset_name]/[dataset_name.json] for question_id
-python query_SA.py --model [name_of_model] --dataset [name_of_dataset] --video_id [id_of_video] --question_id [id_of_question]--gpus [num_of_gpus]
-
-# example
-python query_SA.py --model qwenlm --dataset lvbench --video_id 1 --question_id 0 --gpus 1
+# Use a different LLM model
+python main_embedding_tracking.py \
+    --video sample.mp4 \
+    --description "a car in the parking lot" \
+    --model qwenlm
 ```
 
-You can also run the results for the entire dataset using the following way:
-```bash
-# Setting video_id to -1 indicates that the entire dataset will be processed.
-python query_SA.py --model [name_of_model] --dataset [name_of_dataset] --video_id -1 --gpus [num_of_gpus]
+## Command-Line Arguments
 
-# example
-python query_SA.py --model qwenlm --dataset lvbench --video_id -1 --gpus 1
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `--video` | Path to input video file (required) | - |
+| `--model` | LLM model to use (qwenvl, qwenlm, etc.) | `qwenvl` |
+| `--description` | Text description to search for | - |
+| `--output-dir` | Directory to save extracted images | `extracted_objects` |
+| `--k` | Number of search results to return | `5` |
+| `--max-images` | Maximum images to extract per track | `1` |
+| `--process-only` | Only process video without searching | `False` |
+| `--stats` | Show database statistics | `False` |
+
+## Architecture
+
+### Processing Pipeline
+
+```
+Video Input
+    ↓
+[Object Detection] → YOLOv11 (10 FPS)
+    ↓
+[Object Tracking] → Persistent IDs
+    ↓
+[Embedding Generation] → JinaCLIP embeddings
+    ↓
+[Database Storage] → FAISS + SQLite
+    ↓
+[Event Tracking] → LLM event descriptions (3 FPS)
+    ↓
+[Event Embeddings] → FAISS storage
 ```
 
-## Generate Check_raw_frame_and_Answer Result
-Here, we would like to clarify that the results in the paper were produced using Gemini-1.5-Pro. However, over time, Gemini-1.5-Pro has been deprecated by Google. Therefore, we recommend using QwenVL2.5-7B. (results using this model are also presented in the paper).
+### Search Pipeline
 
-You can generate answers to questions about a specific video in the following way ( **Note**：Before generating the CA Result, the corresponding SA Result must have already been produced ):
-```bash
-# View datas/[dataset_name]/[dataset_name.json] for question_id
-python query_SA.py --model [name_of_model] --dataset [name_of_dataset] --video_id [id_of_video] --question_id [id_of_question]--gpus [num_of_gpus]
-
-# example
-python query_CA.py --model qwenvl --dataset lvbench --video_id 1 --question_id 0 --gpus 1
+```
+Natural Language Query
+    ↓
+[LLM Query Parsing] → Extract intent & constraints
+    ↓
+[Tri-View Retrieval] → Event + Object search
+    ↓
+[Result Filtering] → LLM-based ranking
+    ↓
+[Image Extraction] → Bounding box images
 ```
 
-You can also run the results for the entire dataset using the following way:
-```bash
-# Setting video_id to -1 indicates that the entire dataset will be processed.
-python query_CA.py --model [name_of_model] --dataset [name_of_dataset] --video_id -1 --gpus [num_of_gpus]
+## Project Structure
 
-# example
-python query_CA.py --model qwenvl --dataset lvbench --video_id -1 --gpus 1
+```
+Project-AVAS/
+├── main_embedding_tracking.py    # Main script
+├── AVA/                           # Core analysis modules
+│   ├── object_detect.py          # Object detection & tracking
+│   ├── event_tracker.py          # Event recognition
+│   └── utils.py                  # Utility functions
+├── embeddings/                    # Embedding system
+│   ├── JinaCLIP.py               # JinaCLIP wrapper
+│   ├── FAISSDB.py                # FAISS database
+│   ├── SQLiteDB.py               # SQLite database
+│   └── object_search.py          # Search system
+├── llms/                         # Language models
+│   ├── init_model.py             # Model initialization
+│   ├── QwenVL.py                 # QwenVL model
+│   └── QwenLM.py                 # QwenLM model
+├── checkpoints/                   # Model checkpoints
+│   └── yolo11l.pt
+├── config/                        # Configuration files
+│   └── tracker.yaml
+├── database/                      # Processed video databases
+│   └── <video_name>/
+│       ├── object_embeddings.faiss
+│       ├── event_embeddings.faiss
+│       └── tracked_objects.db
+└── extracted_objects/            # Extracted images
 ```
 
+## Database Schema
 
-## 📄 Citation
+### SQLite Database (`tracked_objects.db`)
 
-If you use this repo, please cite our paper:
-```bibtex
-@article{ava,
-  title={Empowering Agentic Video Analytics Systems with Video Language Models},
-  author={Yan, Yuxuan and Jiang, Shiqi and Cao, Ting and Yang, Yifan and Yang, Qianqian and Shu, Yuanchao and Yang, Yuqing and Qiu, Lili},
-  journal={arXiv preprint arXiv:2505.00254},
-  year={2025}
-}
+**tracked_objects table:**
+- `track_id`: Unique track identifier
+- `class_id`: Object class ID
+- `class_name`: Object class name
+- `first_frame`: First appearance frame
+- `last_frame`: Last appearance frame
+- `total_frames`: Total tracked frames
+- `bbox_history`: JSON array of bounding boxes
+- `confidence_history`: JSON array of confidence scores
+- `frame_numbers`: JSON array of frame numbers
+
+**video_info table:**
+- `video_path`: Path to video file
+- `width`: Video width
+- `height`: Video height
+- `fps`: Original video FPS
+- `total_frames`: Total frame count
+- `processing_fps`: Processing FPS used
+
+### FAISS Databases
+
+- **object_embeddings.faiss**: Object-level embeddings for similarity search
+- **event_embeddings.faiss**: Event-level embeddings for event search
+
+## API Usage
+
+### Process Video Programmatically
+
+```python
+from main_embedding_tracking import process_video
+
+# Process video and generate embeddings
+result = process_video(
+    video_path="path/to/video.mp4",
+    object_faiss_db_path="database/video/object_embeddings.faiss",
+    event_faiss_db_path="database/video/event_embeddings.faiss",
+    object_sqlite_db_path="database/video/tracked_objects.db",
+    model="qwenvl"
+)
 ```
+
+### Search Programmatically
+
+```python
+from main_embedding_tracking import search_video
+from llms.init_model import init_model
+
+# Initialize LLM
+llm = init_model("qwenvl", 1)
+
+# Search for objects
+search_results, saved_images = search_video(
+    query="a person wearing red shirt",
+    video_path="path/to/video.mp4",
+    output_dir="extracted_objects",
+    object_faiss_db_path="database/video/object_embeddings.faiss",
+    event_faiss_db_path="database/video/event_embeddings.faiss",
+    object_sqlite_db_path="database/video/tracked_objects.db",
+    k=5,
+    max_images=10,
+    llm=llm
+)
+```
+
+## Performance Notes
+
+- **Processing Speed**: ~10 FPS for tracking, ~3 FPS for event generation
+- **Memory Usage**: FAISS database is memory-efficient for large-scale search
+- **GPU Acceleration**: Recommended for FAISS-GPU and model inference
+- **Storage**: Each video creates its own database directory
+
+## Troubleshooting
+
+### Common Issues
+
+1. **Model Not Found**: Ensure model checkpoints are in `checkpoints/` directory
+2. **CUDA Out of Memory**: 
+   - Use CPU version: `pip install faiss-cpu`
+   - Reduce batch size in model configuration
+3. **FAISS Import Error**: Install appropriate version:
+   ```bash
+   pip install faiss-gpu  # For CUDA
+   # or
+   pip install faiss-cpu  # For CPU
+   ```
+4. **Database Not Found**: Process video first using `--process-only` flag
+
+### Performance Optimization
+
+1. Use `faiss-gpu` for faster similarity search on CUDA systems
+2. Adjust processing FPS in code for balance between speed and accuracy
+3. Use lighter YOLO models (`yolo11n.pt`) for faster processing
+
+## Advanced Features
+
+### Tri-View Retrieval
+
+The system uses a sophisticated retrieval method that combines:
+- **Event Search**: High-level event descriptions
+- **Object Search**: Fine-grained object matching
+- **LLM Filtering**: Intelligent result ranking and filtering
+
+### Event Tracking
+
+Events are generated by analyzing video chunks:
+- Chunk duration: 3 seconds
+- Processing rate: 3 FPS
+- Contextual understanding of object interactions
+
+## License
+
+See `LICENSE` file for details.
+
+## References
+
+- **YOLOv11**: [Ultralytics](https://github.com/ultralytics/ultralytics)
+- **JinaCLIP**: [Jina AI](https://jina.ai/)
+- **FAISS**: [Facebook AI Research](https://github.com/facebookresearch/faiss)
+- **QwenVL/QwenLM**: [Alibaba Cloud](https://github.com/QwenLM/Qwen2-VL)
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit pull requests or open issues.
+
+## Support
+
+For issues and questions, please open an issue on the project repository.
 

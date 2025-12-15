@@ -8,6 +8,7 @@ from video_utils import VideoRepresentation
 from .prompt import PROMPTS
 from bert_score import score, BERTScorer
 from .utils import compute_mdhash_id, clean_str
+# from crying import predict_audio_chunks, extract_audio_from_mp4
 
 def get_chunk_timestamp(video, chunk_duration, chunk_overlap):
     video_config = video.config
@@ -41,7 +42,8 @@ def batch_generate_descriptions(
     file_path: str,
     batch_size: int,
     global_config: dict,
-    max_retries: int = 5
+    max_retries: int = 5,
+    sound_detections: list[dict] = None,
 ):
     """
     batch generate dense descriptions for each chunk
@@ -67,7 +69,25 @@ def batch_generate_descriptions(
 
         for duration in batch_timestamps:
             num_frames = global_config["video_chunk_num_frames"]
-            frames, _, _ = video.get_frames_by_num(num_frames=num_frames, duration=duration)
+            frames, _, frame_indices = video.get_frames_by_num(num_frames=num_frames, duration=duration)
+            # Read a JSON file
+            # Example: read a file named "input.json" in the current directory
+            json_file_path = os.path.join("../TrackandLog/YOLO-World/onnx_outputs/log_data_child_fall_1.json")
+            if os.path.exists(json_file_path):
+                with open(json_file_path, "r") as jf:
+                    input_json_data = json.load(jf)
+            else:
+                input_json_data = None
+            track_data = []
+            for value in input_json_data:
+                if value['frame_number'] in frame_indices:
+                    track_data.append(value)
+            if sound_detections:
+                for detection in sound_detections:
+                    if detection["chunk_start_sec"] >= duration[0] and detection["chunk_end_sec"] <= duration[1]:
+                        track_data.append(detection)
+            prompt_template = PROMPTS["generate_person_activity_description"]
+            prompt_template = prompt_template.format(inputs=str(track_data))
             inputs = {
                 "text": PROMPTS["generate_description"],
                 "video": frames,
@@ -94,6 +114,59 @@ def batch_generate_descriptions(
             if desc is None and fail_count[i] < max_retries
         ]
 
+    return descriptions
+
+def list_2_dict(detected_objects: list):
+    if detected_objects is None:
+        return None
+    detected_objects_dict = []
+    for object in detected_objects:
+        for track_id, obj in object.items():
+            detected_objects_dict.append({
+                "track_id": track_id,
+                "class_name": obj["class_name"],
+                "bbox_history": obj["bbox_history"],
+                "frame_numbers": obj["frame_numbers"]
+            })
+    return detected_objects_dict
+
+def batch_generate_descriptions_external(
+    llm: BaseVideoModel,
+    batch_size: int,
+    video_chunk_num_frames: int,
+    frame_indices: list = None,
+    frames: list = None,
+    frame_skip: int = 1,
+    detected_objects: list = None,
+):
+    """
+    batch generate dense descriptions for each chunk
+    """    
+    batch_inputs = []
+    
+    print(f"Generating descriptions")
+
+    num_frames = video_chunk_num_frames
+    for batch_idx in range(num_frames//batch_size):
+        frames_batch = frames[batch_idx * batch_size:(batch_idx + 1) * batch_size]
+        prompt_template = PROMPTS["generate_description"]
+        inputs = {
+            "text": prompt_template,
+            "video": frames_batch,
+        }
+        batch_inputs.append(inputs)
+
+    try:
+        batch_descriptions = llm.batch_generate_response(batch_inputs, max_new_tokens=512, temperature=0.5)
+    except Exception as e:
+        print(f"Error generating descriptions: {e}")
+    descriptions = []
+    for i in range(len(batch_descriptions)):
+        descriptions.append({
+            "duration": [frame_indices[i], frame_indices[i + batch_size - 1] + frame_skip - 1],
+            "description": batch_descriptions[i],
+            "objects": detected_objects,
+        })
     return descriptions
 
 def semantic_chunking(
@@ -232,7 +305,7 @@ def format_events(events):
         return formatted_events
         
 
-def extract_events(
+def extract_events_with_audio(
     llm:BaseVideoModel,
     video:VideoRepresentation,
     global_config:dict,
@@ -282,4 +355,36 @@ def extract_events(
     profiling["semantic_chunking"]["total"] = time.time() - profiling["semantic_chunking"]["total"]
     profiling["semantic_chunking"].update(profiling_semantic_chunking)
     return events, profiling
+    
+def extract_events(
+    llm:BaseVideoModel,
+    video:VideoRepresentation,
+    global_config:dict,
+):
+    file_path = os.path.join(global_config["working_dir"], "events")
+    descriptions_start_time = time.time()
+    descriptions = batch_generate_descriptions(
+        llm=llm,
+        video=video,
+        chunk_durations=chunk_durations,
+        file_path=file_path,
+        batch_size=12,
+        global_config=global_config,
+    )
+    descriptions_end_time = time.time()
+    print(f"Time taken for descriptions: {descriptions_end_time - descriptions_start_time} seconds")
+    # step 3: merge descriptions to events
+    events_start_time = time.time()
+    events = semantic_chunking(
+        llm=llm,
+        video=video,
+        descriptions=descriptions,
+        chunk_durations=chunk_durations,
+        file_path=file_path,
+        global_config=global_config,
+        batch_size=12,
+    )
+    events_end_time = time.time()
+    print(f"Time taken for semantic chunking: {events_end_time - events_start_time} seconds")
+    return events
     
