@@ -9,7 +9,7 @@ from llms.init_model import init_model
 import argparse
 import logging
 from datetime import datetime
-
+import time
 
 def safe_write_json(file_path, data, max_retries=10):
     """Safely write JSON data to file with file locking to prevent race conditions"""
@@ -177,7 +177,7 @@ if __name__ == "__main__":
         
         # Tree search
         tree_search_start = time.time()
-        ava.query_tree_search(qas[args.question_id]["question"], args.question_id, retrieval_mode=args.retrieval_mode)
+        ava.query_tree_search(qas[args.question_id]["question"], args.question_id, retrieval_mode=args.retrieval_mode, re_process=True)
         tree_search_end = log_timing(profiler_logger, "Tree Search", tree_search_start)
         
         # Answer generation

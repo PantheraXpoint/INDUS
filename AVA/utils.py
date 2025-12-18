@@ -160,7 +160,7 @@ def tri_view_retrieval(
     if retrieval_mode not in valid_modes:
         raise ValueError(f"retrieval_mode must be one of {valid_modes}, got: {retrieval_mode}")
     
-    top_k_for_events = 5
+    top_k_for_events = 50
     top_k_for_entities = 5
     S = 1/2
     

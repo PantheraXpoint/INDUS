@@ -55,7 +55,7 @@ class EventTracker:
                                                 frame_skip=frame_skip,
                                                 detected_objects=detected_objects)
         # TODO: add semantic chunking
-        self.buffer_descriptions.extend(descriptions)
+        # self.buffer_descriptions.extend(descriptions)
         
         self._add_descriptions(descriptions)
 
@@ -131,7 +131,8 @@ class EventTracker:
         if self.faiss_db is not None:
             try:
                 for description in descriptions:
-                    chunks = chunk_text(description["description"])
+                    # chunks = chunk_text(description["description"])
+                    chunks = [description["description"]]
                     embeddings = self.embedding_model.get_text_features(chunks)
                     for chunk_index, chunk in enumerate(chunks):
                         faiss_id = self.faiss_db.add_embedding(embeddings[chunk_index], str(description["duration"][0]) + "_" + str(chunk_index), {
