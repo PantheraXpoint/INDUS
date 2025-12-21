@@ -190,21 +190,21 @@ if __name__ == "__main__":
         
         profiler_logger.info("=== SINGLE VIDEO PROCESSING COMPLETED ===")
         print(final_sa_answer)
-    elif args.question_id is not None:
-        dataset = init_dataset(args.dataset, args.video_path)
-        llm = init_model(args.model, args.gpus)
+    # elif args.question_id is not None:
+    #     dataset = init_dataset(args.dataset, args.video_path)
+    #     llm = init_model(args.model, args.gpus)
         
-        video = dataset.get_video()
+    #     video = dataset.get_video()
         
-        ava = AVA(
-            video=video,
-            llm_model=llm,
-        )
+    #     ava = AVA(
+    #         video=video,
+    #         llm_model=llm,
+    #     )
         
-        ava.query_tree_search(args.question)
+    #     ava.query_tree_search(args.question)
         
-        final_sa_answer = ava.generate_SA_answer(args.question)
-        print(final_sa_answer)
+    #     final_sa_answer = ava.generate_SA_answer(args.question)
+    #     print(final_sa_answer)
     else:
         # Validate process number
         if args.process_num is None:

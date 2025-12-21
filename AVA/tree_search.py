@@ -70,7 +70,6 @@ def tri_view_retrieval(
     # Vector database queries
     vector_queries_start = time.time()
     events_result = events_vdb.query(keywords_response, top_k=top_k_for_events)
-    breakpoint()
     entities_result = entities_vdb.query(rewrite_entity_response, top_k=top_k_for_entities)
     features_result = features_vdb.query(rewrite_feature_response, top_k=top_k_for_features)
     vector_queries_end = time.time()

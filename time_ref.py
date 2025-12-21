@@ -148,6 +148,29 @@ def run_lvbench_benchmark():
     print(f"Average Overlap: {sum(overlap_dataset) / len(overlap_dataset)}")
 
 
+def run_ava100_benchmark_ava():
+    datasets = ["citytour", "ego", "traffic", "wildlife"]
+    for dataset in datasets:
+        data_path = f"datas/AVA100/{dataset}.json"
+        with open(data_path, 'r') as f:
+            data = json.load(f)
+        for item in data:
+            video_key = item["video_key"]
+            for question in item["qa"]:
+                graph_datas = glob.glob(f"ava100_results/{video_key}/q{question['question_id']}/subgraph_*.json")
+                overlap_list = []
+                for graph_data in graph_datas:
+                    graph_data = load_data(graph_data)
+                    time_reference = load_data(f"datas/AVA100/{dataset}.json")
+                    time_reference = time_reference[int(video_key[-1])-1]["qa"][int(question["question_id"])]
+                    overlap = overlap_reference(graph_data, time_reference)
+                    if overlap is not None:
+                        overlap_list.append(overlap)
+                if len(overlap_list) > 0:
+                    print(f"Video: {video_key}, Question: {question['question_id']}, Overlap: {sum(overlap_list)}")
+                else:
+                    print(f"Video: {video_key}, Question: {question['question_id']}, No overlap")
+
 
 if __name__ == "__main__":
     run_ava100_benchmark()

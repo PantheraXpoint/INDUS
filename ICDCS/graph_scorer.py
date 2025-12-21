@@ -17,6 +17,10 @@ class GraphScorer:
             'object_to_event': 0.9,    # Structure (Uniqueness applies)
             'vector_object': 0.6,       # Inference (Risky - Compass Rule)
             'vector_event': 0.5,        # Inference (Bridge)
+
+            # RELATION VIEW (NEW)
+            'relation': 0.9,           # Object -> Relation Node (Explicit Structure)
+            'relation_target': 0.95,   # Relation Node -> Target Object (Pass-through, high trust)
             
             # CONTEXT-BASED: Object↔Object and Event↔Event ONLY via Context (no KG structure)
             'context_relation': 0.8,       # Object→Object from Context Graph
@@ -82,7 +86,7 @@ class GraphScorer:
         # 2. Structural Penalties/Bonuses
         
         # A. Hub Penalty (Logarithmic) - For Event->Object
-        if op_type == 'event_to_object' and hub_size > 1:
+        if (op_type == 'event_to_object' or op_type == 'relation') and hub_size > 1:
             energy /= math.log(hub_size + 1)
             
         # B. Uniqueness Bonus (Inverse Log) - For Object->Event

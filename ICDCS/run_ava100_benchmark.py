@@ -21,11 +21,10 @@ from ICDCS.graph_interfaces import KnowledgeGraphInterface, ContextGraphInterfac
 from ICDCS.graph_scorer import GraphScorer
 from ICDCS.graph_engine import GraphEngine
 from ICDCS.export_subgraph import export_subgraph_to_json, export_all_subgraphs
-from pymilvus import connections
 
 
 class AVA100Benchmark:
-    def __init__(self, base_data_dir="datas/AVA100", base_db_dir="database", output_dir="ava100_results", 
+    def __init__(self, base_data_dir="datas/AVA100", base_db_dir="AVA_cache/AVA100", output_dir="ava100_results", 
                  use_cache=True, memory_threshold_percent=80.0):
         # Get project root directory (parent of ICDCS directory)
         project_root = Path(__file__).parent.parent
@@ -37,7 +36,8 @@ class AVA100Benchmark:
         self.memory_threshold = memory_threshold_percent
         
         # Dataset configurations
-        self.datasets = ["citytour", "ego", "traffic", "wildlife"]
+        # Order: ego first (video indices 1-2), then citytour (3-4), traffic (5-6), wildlife (7-8)
+        self.datasets = ["ego", "citytour", "wildlife", "traffic"]
         
         # Reusable graph components (kept in memory until threshold exceeded)
         self.current_graph_engine = None
@@ -46,6 +46,9 @@ class AVA100Benchmark:
         self.current_ctx = None
         self.current_scorer = None
         self.active_connection_aliases = []
+        
+        # Build mapping from video_index (1-8) to video_key by reading config.json files
+        self.video_index_to_key = self._build_video_index_mapping()
         
         # Initialize models once (reuse across queries)
         print("=" * 80)
@@ -56,6 +59,56 @@ class AVA100Benchmark:
         print("✅ Models initialized\n")
         print(f"💾 Memory threshold: {self.memory_threshold}%")
     
+    def _build_video_index_mapping(self):
+        """
+        Build mapping from video_index (1-8) to video_key by reading config.json files.
+        
+        Returns:
+            Dict mapping video_index (int) -> video_key (str)
+            Example: {1: "ego1", 2: "ego2", 3: "citytour1", ...}
+        """
+        mapping = {}
+        
+        # Check video indices 1-8
+        for video_index in range(1, 9):
+            config_path = self.base_db_dir / str(video_index) / "config.json"
+            
+            if config_path.exists():
+                try:
+                    with open(config_path, 'r') as f:
+                        config = json.load(f)
+                        source_path = config.get('source_path', '')
+                        
+                        # Extract video_key from source_path
+                        # Example: "datas/AVA100/videos/ego2.mp4" -> "ego2"
+                        if source_path:
+                            # Get filename without extension
+                            filename = Path(source_path).stem
+                            mapping[video_index] = filename
+                            print(f"📋 Mapped video_index {video_index} -> {filename}")
+                except Exception as e:
+                    print(f"⚠️  Failed to read config.json for video_index {video_index}: {e}")
+            else:
+                print(f"⚠️  config.json not found for video_index {video_index} at {config_path}")
+        
+        print(f"✅ Built mapping for {len(mapping)} videos\n")
+        return mapping
+    
+    def get_video_index_from_key(self, video_key):
+        """
+        Get video_index (1-8) for a given video_key by looking up the mapping.
+        
+        Args:
+            video_key: e.g., "ego1", "citytour2", etc.
+        
+        Returns:
+            video_index (int) or None if not found
+        """
+        for video_index, mapped_key in self.video_index_to_key.items():
+            if mapped_key == video_key:
+                return video_index
+        return None
+    
     def load_dataset_json(self, dataset_name):
         """Load JSON file for a specific dataset."""
         json_path = self.base_data_dir / f"{dataset_name}.json"
@@ -64,14 +117,55 @@ class AVA100Benchmark:
         with open(json_path, 'r') as f:
             return json.load(f)
     
-    def get_db_paths(self, video_key):
-        """Get database paths for a specific video."""
-        db_dir = self.base_db_dir / video_key
-        return {
-            'object_db': str(db_dir / "object_embeddings.db"),
-            'event_db': str(db_dir / "event_embeddings.db"),
-            'sqlite_db': str(db_dir / "tracked_objects.db")
-        }
+    def get_kg_dir(self, video_index):
+        """Get the Knowledge Graph directory for a specific video.
+        
+        Args:
+            video_index: Video index (1-8) corresponding to folder in AVA_cache/AVA100/
+        
+        Returns:
+            Path to the kg directory: AVA_cache/AVA100/{video_index}/kg
+        """
+        # AVA creates a 'kg' folder inside the video's work directory
+        # Path structure: AVA_cache/AVA100/{video_index}/kg
+        return str(self.base_db_dir / str(video_index) / "kg")
+    
+    def is_video_empty(self, kg_dir):
+        """
+        Check if a video's kg directory is empty (has no events or entities).
+        
+        Args:
+            kg_dir: Path to the kg directory
+        
+        Returns:
+            True if video is empty (no events or entities), False otherwise
+        """
+        vdb_events_path = Path(kg_dir) / "vdb_events.json"
+        vdb_entities_path = Path(kg_dir) / "vdb_entities.json"
+        
+        # Check if files exist
+        if not vdb_events_path.exists() or not vdb_entities_path.exists():
+            return True
+        
+        try:
+            # Check events
+            with open(vdb_events_path, 'r') as f:
+                events_data = json.load(f)
+                events_list = events_data.get('data', [])
+                if not events_list or len(events_list) == 0:
+                    return True
+            
+            # Check entities
+            with open(vdb_entities_path, 'r') as f:
+                entities_data = json.load(f)
+                entities_list = entities_data.get('data', [])
+                if not entities_list or len(entities_list) == 0:
+                    return True
+            
+            return False
+        except (json.JSONDecodeError, KeyError, Exception) as e:
+            # If we can't read the files, consider it empty
+            return True
     
     def is_query_cached(self, video_key, question_id):
         """
@@ -145,16 +239,6 @@ class AVA100Benchmark:
     
     def cleanup_graph_components(self):
         """Cleanup current graph engine and connections."""
-        # Disconnect Milvus connections
-        for alias in self.active_connection_aliases:
-            try:
-                if connections.has_connection(alias):
-                    connections.disconnect(alias)
-                    print(f"  🔌 Disconnected: {alias}")
-            except Exception as e:
-                print(f"  ⚠️  Failed to disconnect {alias}: {e}")
-        
-        self.active_connection_aliases = []
         
         # Clear instances
         self.current_graph_engine = None
@@ -163,14 +247,14 @@ class AVA100Benchmark:
         self.current_scorer = None
         self.current_video_key = None
     
-    def get_or_create_graph_engine(self, video_key, db_paths):
+    def get_or_create_graph_engine(self, video_key, kg_dir):
         """
         Get existing graph engine or create new one.
         Reuses instance if same video and memory is OK.
         
         Args:
             video_key: Video identifier (e.g., "citytour1")
-            db_paths: Dictionary with database paths
+            kg_dir: Knowledge Graph directory
         
         Returns:
             GraphEngine instance (reused or newly created)
@@ -191,19 +275,10 @@ class AVA100Benchmark:
         if self.current_graph_engine is None:
             print(f"🔧 Initializing graph engine for {video_key}... (mem: {mem_usage:.1f}%)")
             
-            # Clean up any stale connections first
-            for alias in ['milvus_object_embeddings', 'milvus_event_embeddings', f'milvus_{video_key}_context']:
-                try:
-                    if connections.has_connection(alias):
-                        connections.disconnect(alias)
-                except:
-                    pass
             
             # Initialize graph components (KnowledgeGraphInterface creates its own connections)
             self.current_kg = KnowledgeGraphInterface(
-                object_faiss_db_path=db_paths['object_db'],
-                event_faiss_db_path=db_paths['event_db'],
-                object_sqlite_db_path=db_paths['sqlite_db'],
+                working_dir=kg_dir,
                 embedding_model=self.embedding_model,
                 embedding_dim=768
             )
@@ -231,7 +306,7 @@ class AVA100Benchmark:
         
         return self.current_graph_engine
     
-    def run_single_query(self, video_key, query, question_id, qa_data, db_paths, max_iterations=10):
+    def run_single_query(self, video_key, query, question_id, qa_data, kg_dir, max_iterations=10):
         """
         Run graph engine for a single query using reusable engine instance.
         
@@ -240,7 +315,7 @@ class AVA100Benchmark:
             query: The question text
             question_id: Question ID from dataset
             qa_data: Full question data including options, answer, time_reference
-            db_paths: Dictionary with database paths
+            kg_dir: Knowledge Graph directory
             max_iterations: Max graph exploration iterations
         
         Returns:
@@ -253,7 +328,7 @@ class AVA100Benchmark:
         
         try:
             # Get or create graph engine (memory-aware reuse)
-            engine = self.get_or_create_graph_engine(video_key, db_paths)
+            engine = self.get_or_create_graph_engine(video_key, kg_dir)
             
             # Run graph engine
             # Note: query_embedding parameter is kept for compatibility but not used internally
@@ -417,13 +492,24 @@ class AVA100Benchmark:
             video_key = video_data['video_key']
             questions = video_data['qa']
             
-            # Check if database exists
-            db_paths = self.get_db_paths(video_key)
-            if not Path(db_paths['object_db']).exists():
-                print(f"⚠️  Skipping {video_key}: Database not found at {db_paths['object_db']}")
+            # Map video_key to video_index (1-8) using config.json mapping
+            video_index = self.get_video_index_from_key(video_key)
+            if video_index is None:
+                print(f"⚠️  Skipping {video_key}: No video_index found in AVA_cache/AVA100/ (video not preprocessed)")
                 continue
             
-            print(f"\n📹 Processing video: {video_key} ({len(questions)} questions)")
+            # Check if KG directory exists
+            kg_dir = self.get_kg_dir(video_index)
+            if not os.path.exists(kg_dir):
+                print(f"⚠️  Skipping {video_key} (video_index={video_index}): KG directory not found at {kg_dir}")
+                continue
+            
+            # Check if video is empty (no events or entities)
+            if self.is_video_empty(kg_dir):
+                print(f"⚠️  Skipping {video_key} (video_index={video_index}): Video has no events or entities (empty data)")
+                continue
+            
+            print(f"\n📹 Processing video: {video_key} (video_index={video_index}, {len(questions)} questions)")
             
             # Limit questions if specified (for testing)
             if limit_per_video:
@@ -432,7 +518,10 @@ class AVA100Benchmark:
             
             # Process each question
             for qa in questions:
-                query = qa['query']
+                question = qa["query"]
+                options = qa["options"]
+                concat_question = f"{question}\n{options[0]}\n{options[1]}\n{options[2]}\n{options[3]}"
+                query = concat_question
                 question_id = qa['question_id']
                 
                 # Check cache first
@@ -450,8 +539,8 @@ class AVA100Benchmark:
                         video_key=video_key,
                         query=query,
                         question_id=question_id,
-                        qa_data=qa,  # Pass full question data
-                        db_paths=db_paths,
+                        qa_data=qa,
+                        kg_dir=kg_dir, 
                         max_iterations=max_iterations
                     )
                 
