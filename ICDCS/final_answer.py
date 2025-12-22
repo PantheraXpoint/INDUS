@@ -193,7 +193,7 @@ def load_graph_data(json_path: str) -> Dict[str, Any]:
     return data
 
 
-def format_nodes_as_segments(graph_data: Dict[str, Any]) -> str:
+def format_nodes_as_segments(graph_data: Dict[str, Any], limited_ratio: float = 1.0) -> str:
     """
     Format graph nodes (events and objects) into a readable segment format.
     Groups objects under their associated events.
@@ -213,7 +213,11 @@ def format_nodes_as_segments(graph_data: Dict[str, Any]) -> str:
     """
     nodes = graph_data.get('nodes', [])
     edges = graph_data.get('edges', [])
-    
+    if limited_ratio < 1.0:
+        nodes = nodes[:int(len(nodes) * limited_ratio)]
+        edges = edges[:int(len(edges) * limited_ratio)]
+    print(f"Limited nodes: {len(nodes)}")
+    print(f"Limited edges: {len(edges)}")
     # Create mappings for quick lookup
     node_map = {node['id']: node for node in nodes}
     events = [node for node in nodes if node.get('type') == 'event']
@@ -266,6 +270,8 @@ def format_nodes_as_segments(graph_data: Dict[str, Any]) -> str:
         
         # Get objects associated with this event
         associated_objects = event_to_objects.get(event_id, [])
+        if len(associated_objects) > 5:
+            associated_objects = associated_objects[:5]
         
         if associated_objects:
             segments.append(f"Objects in Event {event_id}:")
@@ -469,7 +475,7 @@ def generate_final_answer(
         raise ValueError("Query is not found in the summary file")
     
     # Format the graph information as video segments
-    video_segments = format_nodes_as_segments(graph_data)
+    video_segments = format_nodes_as_segments(graph_data, limited_ratio=0.2)
     
     # Get the prompt template
     if prompt_template not in PROMPTS:
@@ -543,8 +549,8 @@ def run_ava_100_benchmark(graph_folder: str, video_path: str):
     for question_folder in sorted(questions_folder):
         # Save to file if specified
         output = f"{question_folder}/final_answer.json"
-        if os.path.exists(output):
-            continue
+        # if os.path.exists(output):
+        #     continue
         start_time = time.time()
         # Generate answer
         e2e_results = generate_e2e_answer(
@@ -703,8 +709,16 @@ def main():
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description='Generate answers from queries using knowledge graph')
+    parser.add_argument('--video_range', type=str, help='Video range')
     # main()
-    dataset_names = ["traffic2"]
-    for dataset_name in dataset_names:
+    args = parser.parse_args()
+    video_range = args.video_range.split("-")
+    video_range = [int(video_range[0]), int(video_range[1])]
+    dataset_names = ["citytour1", "ego1", "traffic1", "wildlife1", "citytour2", "ego2", "traffic2", "wildlife2"]
+    for idx, dataset_name in enumerate(dataset_names):
+        if idx < video_range[0] or idx > video_range[1]:
+            continue
         run_ava_100_benchmark(graph_folder=f"ava100_results/{dataset_name}", video_path=f"datas/AVA100/videos/{dataset_name}.mp4")
 

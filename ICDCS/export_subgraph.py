@@ -102,7 +102,9 @@ def export_subgraph_to_json(subgraph: Subgraph, output_path: str = None) -> Dict
     if output_path:
         with open(output_path, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
-        print(f"📄 Exported subgraph '{subgraph.id}' to {output_path}")
+
+        display_id = (subgraph.id[:50] + '...') if len(subgraph.id) > 50 else subgraph.id
+        print(f"📄 Exported subgraph '{display_id}' to {output_path}")
     
     return data
 
