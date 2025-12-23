@@ -13,6 +13,7 @@ from PIL import Image
 import cv2
 import glob
 import time
+from time_ref import overlap_reference_helper
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -192,8 +193,28 @@ def load_graph_data(json_path: str) -> Dict[str, Any]:
         data = json.load(f)
     return data
 
+def check_overlap(nodes: List[Dict[str, Any]], time_reference: str):
+    """
+    Check if the overlap of the nodes and edges is greater than 0.5.
+    """
+    time_list = []
+    for node in nodes:
+        if node["type"] == "event":
+            start_time = node["metadata"]["duration"][0]
+            end_time = node["metadata"]["duration"][1]
+            if end_time > start_time:
+                time_list.append((start_time, end_time))
+        if node["type"] == "object":
+            for duration in node["metadata"]["durations"]:
+                start_time = duration[0]
+                end_time = duration[1]
+                if end_time > start_time:
+                    time_list.append((start_time, end_time))
+    overlap = overlap_reference_helper(time_reference, time_list)
+    return overlap
 
-def format_nodes_as_segments(graph_data: Dict[str, Any], limited_ratio: float = 1.0) -> str:
+
+def format_nodes_as_segments(graph_data: Dict[str, Any], limited_ratio: float, time_reference: str) -> str:
     """
     Format graph nodes (events and objects) into a readable segment format.
     Groups objects under their associated events.
@@ -216,6 +237,8 @@ def format_nodes_as_segments(graph_data: Dict[str, Any], limited_ratio: float = 
     if limited_ratio < 1.0:
         nodes = nodes[:int(len(nodes) * limited_ratio)]
         edges = edges[:int(len(edges) * limited_ratio)]
+    overlap = check_overlap(nodes, time_reference)
+    print(f"Overlap: {overlap}")
     print(f"Limited nodes: {len(nodes)}")
     print(f"Limited edges: {len(edges)}")
     # Create mappings for quick lookup
@@ -300,7 +323,7 @@ def format_nodes_as_segments(graph_data: Dict[str, Any], limited_ratio: float = 
             segments.append("(No objects associated)")
             segments.append("")
     
-    return "\n".join(segments)
+    return "\n".join(segments), overlap
 
 
 def format_graph_summary(graph_data: Dict[str, Any]) -> str:
@@ -475,7 +498,8 @@ def generate_final_answer(
         raise ValueError("Query is not found in the summary file")
     
     # Format the graph information as video segments
-    video_segments = format_nodes_as_segments(graph_data, limited_ratio=0.2)
+    time_reference = graph_data["query_metadata"]["time_reference"]
+    video_segments, overlap = format_nodes_as_segments(graph_data, limited_ratio=1.0, time_reference=time_reference)
     
     # Get the prompt template
     if prompt_template not in PROMPTS:
@@ -495,6 +519,7 @@ def generate_final_answer(
         'prompt_template': prompt_template,
         'formatted_prompt': formatted_prompt,
         'graph_statistics': graph_data.get('statistics', {}),
+        'overlap': overlap,
     }
     
     # Generate answer using LLM if provided

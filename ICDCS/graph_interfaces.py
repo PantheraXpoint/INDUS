@@ -302,27 +302,48 @@ class KnowledgeGraphInterface:
 
     def _create_node_from_vdb_result(self, res: dict, node_type: str) -> Node:
         """Helper to convert NanoDB result dict to ICDCS Node object."""
-        # Extract embedding safely
+        
+        # 1. Determine Content based on schema differences
+        content = ""
+        
+        # Events & Relations: Single 'description' string
+        if 'description' in res and res['description']:
+            content = res['description']
+            
+        # Objects (Entities): List of 'descriptions'
+        elif 'descriptions' in res and res['descriptions']:
+            val = res['descriptions']
+            if isinstance(val, list):
+                content = " ".join(val) # Join list into single string
+            elif isinstance(val, str):
+                content = val
+        
+        # 2. Extract or Generate Embedding (THE FIX for "No Vector Mapping")
         vector = res.get('__vector__')
+        
+        # Convert list to numpy if needed
         if vector is not None and not isinstance(vector, np.ndarray):
             vector = np.array(vector)
             
-        # Handle description mapping based on node type
-        content = ""
-        if 'description' in res:
-            content = res['description']
-        elif 'descriptions' in res: # entities have plural descriptions
-            content = " ".join(res['descriptions']) if res['descriptions'] else ""
+        # CRITICAL: If vector is missing (lazy loaded by get_data), RE-EMBED immediately
+        if vector is None and content and self.embedding_model:
+            try:
+                # embedding_model.get_text_features expects a List[str]
+                vector = self.embedding_model.get_text_features([content])[0]
+            except Exception as e:
+                # print(f"⚠️ Error re-embedding node {res.get('id')}: {e}")
+                vector = None
 
-        # Create metadata dict excluding huge vector to save memory
+        # 3. Create Metadata (exclude vector to save RAM)
         metadata = {k: v for k, v in res.items() if k != '__vector__'}
-
+        
+        # Handle ID safely (DB might use 'id' or '__id__')
         node_id = str(res.get('id', res.get('__id__')))
 
         return Node(
             id=node_id,
             type=node_type,
-            score=float(res.get('__metrics__', 0.0)), # Score from vector query if present
+            score=float(res.get('__metrics__', 0.0)),
             embedding=vector,
             content=content,
             metadata=metadata

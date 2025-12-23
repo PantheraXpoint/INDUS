@@ -14,7 +14,6 @@ def time_to_seconds(time_str: str):
         hours, minutes, seconds = time_str.split(":")
         return int(hours) * 3600 + int(minutes) * 60 + int(seconds)
     else:
-        breakpoint()
         raise ValueError(f"Invalid time string: {time_str}")
 
 from typing import List, Tuple
@@ -56,6 +55,7 @@ def percentage_overlap(time_list: List[Tuple[int, int]], time_ref: Tuple[int, in
     return total_covered / ref_length  # 0.0–1.0
 
 def overlap_reference_helper(time_ref: str, time_list: List[Tuple[int, int]]):
+    time_ref = time_ref.strip()
     if time_ref == "N/A" or time_ref == "" or time_ref == "None" or time_ref == "None-None":
         return None
     if "-" in time_ref:
@@ -125,9 +125,46 @@ def run_lvbench_benchmark():
     lvbench_data = load_data("datas/LVBench/LVBench.json")
     overlap_dataset = []
     for video_folder in video_folders:
+        if not os.path.exists(os.path.join(video_folder, "config.json")):
+            print(f"No config.json in {video_folder}")
+            continue
         video_key = load_data(os.path.join(video_folder, "config.json"))["source_path"].split("/")[-1].split(".")[0]
-        for item in lvbench_data:
+        res = []
+        for idx, item in enumerate(lvbench_data):
             if item["key"] == video_key:
+                for q_id, question in enumerate(item["qa"]):
+                    if not os.path.exists(f"{video_folder}/questions/{q_id}/sorted_SA_score_result.json"):
+                        print(f"No sorted_SA_score_result.json in {video_folder}/questions/{q_id}")
+                        continue
+                    graph_datas = load_data(f"{video_folder}/questions/{q_id}/sorted_SA_score_result.json")
+                    overlap_list = []
+                    for graph_data in graph_datas:
+                        if graph_data["depth"] != 3: # only consider the first depth
+                            continue
+                        graph_data = graph_data["frame_durations"]
+                        graph_data = [(start, end) for start, end in graph_data]
+                        time_reference = question["time_reference"].strip()
+                        # print(time_reference)
+                        overlap = overlap_reference_helper(time_reference, graph_data)
+                        if overlap is not None:
+                            overlap_list.append(overlap)
+                    if len(overlap_list) > 0:
+                        print(f"Video: {video_key}, Question: {q_id}, Overlap: {sum(overlap_list) / len(overlap_list)}")
+                        overlap_dataset.append(sum(overlap_list) / len(overlap_list))
+                        res.append({"video_id": idx, "question_id": q_id, "overlap": sum(overlap_list) / len(overlap_list)})
+                    
+    print(f"Average Overlap: {sum(overlap_dataset) / len(overlap_dataset)}")
+    json.dump(res, open("lvbench_overlap.json", "w"), indent=4)
+
+
+def run_ava100_benchmark_ava():
+    video_folders = glob.glob("AVA_cache/AVA100/*")
+    overlap_dataset = []
+    for video_folder in video_folders:
+        video_key = load_data(os.path.join(video_folder, "config.json"))["source_path"].split("/")[-1].split(".")[0]
+        data = load_data(f"datas/AVA100/{video_key[:-1]}.json")
+        for item in data:
+            if item["video_key"] == video_key:
                 for q_id, question in enumerate(item["qa"]):
                     graph_datas = load_data(f"{video_folder}/questions/{q_id}/sorted_SA_score_result.json")
                     overlap_list = []
@@ -148,30 +185,6 @@ def run_lvbench_benchmark():
     print(f"Average Overlap: {sum(overlap_dataset) / len(overlap_dataset)}")
 
 
-def run_ava100_benchmark_ava():
-    datasets = ["citytour", "ego", "traffic", "wildlife"]
-    for dataset in datasets:
-        data_path = f"datas/AVA100/{dataset}.json"
-        with open(data_path, 'r') as f:
-            data = json.load(f)
-        for item in data:
-            video_key = item["video_key"]
-            for question in item["qa"]:
-                graph_datas = glob.glob(f"ava100_results/{video_key}/q{question['question_id']}/subgraph_*.json")
-                overlap_list = []
-                for graph_data in graph_datas:
-                    graph_data = load_data(graph_data)
-                    time_reference = load_data(f"datas/AVA100/{dataset}.json")
-                    time_reference = time_reference[int(video_key[-1])-1]["qa"][int(question["question_id"])]
-                    overlap = overlap_reference(graph_data, time_reference)
-                    if overlap is not None:
-                        overlap_list.append(overlap)
-                if len(overlap_list) > 0:
-                    print(f"Video: {video_key}, Question: {question['question_id']}, Overlap: {sum(overlap_list)}")
-                else:
-                    print(f"Video: {video_key}, Question: {question['question_id']}, No overlap")
-
-
 if __name__ == "__main__":
-    run_ava100_benchmark()
-    # run_lvbench_benchmark()
+    # run_ava100_benchmark_ava()
+    run_lvbench_benchmark()

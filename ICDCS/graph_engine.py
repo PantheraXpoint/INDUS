@@ -122,24 +122,25 @@ class GraphEngine:
 
         # Pruning Configuration
         self.pruning_config = {
-            # RANK-BASED BUDGETS
-            # We target a total of ~300 nodes.
-            # We cap Events+Objects at 240 (80+160) to leave ~60 spots (20%) for Steiner Bridges.
+            # STRICT BUDGET: 50 NODES
+            'max_total_nodes': 50,
             
-            'max_event_nodes': 80,          # Reduced from 100
-            'max_object_nodes': 160,        # Reduced from 200
-            'max_total_nodes': 300,         # Reduced from 350 to match your selection budget
-            'max_edges': 900,               # Increased slightly to allow denser connections
+            # Dynamic Ratio: We no longer hard-cap events/objects.
+            # They compete based on score.
+            'max_event_nodes': 50, 
+            'max_object_nodes': 50,
             
-            # Saturation detection
+            # EDGE SAFETY: High limit to prevent "Prune Nodes -> Keep Edges -> Trigger Again" loop
+            'max_edges': 1500,  
+            
+            # Saturation
             'score_saturation_threshold': 0.95,
-            'saturation_count_trigger': 100,
+            'saturation_count_trigger': 20, # Scaled down for 50 nodes
             
             # Steiner tree settings
             'use_articulation_points': True,
             'use_shortest_paths': True,
-            # Fixed typo: limit was 100 but comment said 300. Set to 300.
-            'shortest_path_node_limit': 300, 
+            'shortest_path_node_limit': 100,
             'max_path_length': 3,
         }
 
@@ -151,10 +152,10 @@ class GraphEngine:
         self.current_keywords = ""
         self.current_iteration = 0
         self.iteration_metrics = []
-    
-    def _embedding_to_key(self, embedding: np.ndarray) -> str:
-        """Convert embedding to cache key using fast hash."""
-        return hashlib.md5(embedding.tobytes()).hexdigest()
+
+        # NEW: Track per-operation success
+        self._op_stats = defaultdict(lambda: {'attempted': 0, 'added': 0})
+
     
     def _get_cache_statistics(self) -> Dict:
         """Generate detailed cache statistics."""
@@ -223,29 +224,6 @@ class GraphEngine:
         """
         return self.iteration_metrics
 
-    def _subgraph_to_evaluation_format(self, subgraph: Subgraph) -> Dict[str, Any]:
-        """
-        Convert a Subgraph object to the format expected by overlap_reference.
-        
-        Returns:
-            Dictionary with 'nodes' list, where each event node has:
-            - type: "event"
-            - metadata: {"start_time": int, "end_time": int} (in frames)
-        """
-        nodes_list = []
-        for node in subgraph.nodes.values():
-            if node.type == 'event':
-                # Extract start_time and end_time from metadata (in frames)
-                start_time = node.metadata.get('start_time', 0)
-                end_time = node.metadata.get('end_time', 0)
-                nodes_list.append({
-                    'type': 'event',
-                    'metadata': {
-                        'start_time': start_time,
-                        'end_time': end_time
-                    }
-                })
-        return {'nodes': nodes_list}
     
     def _evaluate_subgraphs(self, time_reference: str) -> List[Dict]:
         """
@@ -395,25 +373,10 @@ class GraphEngine:
         # 1. Initialization
         self._initial_exploration(query)
         
-        # --- CRITICAL CHECK 1: Did we create ANY subgraphs? ---
-        if not self.subgraphs:
-            print("\n" + "!"*60)
-            print("❌ CRITICAL FAILURE: No subgraphs were created during Initialization.")
-            print("   Possible causes:")
-            print("   1. All retrieved events/objects were filtered out by Gatekeeper (Bad Data).")
-            print("   2. No connections found between events and objects.")
-            print("!"*60)
-            print("🛑 Pausing execution. Check 'self.kg.search_events_by_description' results.")
-            breakpoint() # <--- WILL STOP HERE IF INITIALIZATION FAILS
-        
-        print(f"Initialized with {len(self.subgraphs)} subgraphs")
-        self._print_graph_health("After Initialization")
-        
         # Evaluate after seed initialization
         if time_reference:
             print(">> Running Initial Evaluation (Self-Healing)...")
             self._log_iteration_evaluation("iteration_0_seeds", time_reference)
-            self._print_graph_health("After Initial Self-Healing")
         
         graph_size_history = []
         
@@ -422,60 +385,36 @@ class GraphEngine:
             self.current_iteration = i + 1
             print(f"\n--- Iteration {self.current_iteration} ---")
             
-            # Stop if all subgraphs are dead
-            total_nodes = sum(len(sg.nodes) for sg in self.subgraphs)
-            
-            # --- CRITICAL CHECK 2: Did everything die? ---
-            if total_nodes == 0:
-                print("\n" + "!"*60)
-                print("❌ CRITICAL FAILURE: All subgraphs have died (0 nodes remaining).")
-                print("!"*60)
-                print("🛑 Pausing execution.")
-                breakpoint() # <--- WILL STOP HERE IF GRAPH DIES
-                break
-            
-            if total_nodes > 1000:
-                print(f"⚠️  Graph exceeded size limit ({total_nodes} > 1000). Stopping.")
-                break
             
             # Expansion
             for subgraph in self.subgraphs[:]:
-                if len(subgraph.nodes) == 0:
-                    continue
                 
                 active_events = subgraph.get_nodes_by_type('event')
                 active_objects = subgraph.get_nodes_by_type('object')
-                strategy_mode = self._determine_strategy(subgraph)
                 
-                # Execution
-                if strategy_mode == 'GROUNDING':
-                    self._process_event_stream(active_events, subgraph, strategy_mode='GROUNDING', allowed_ops=['event_to_object', 'vector_event'])
-                elif strategy_mode == 'BRIDGING':
-                    self._process_object_stream(active_objects, subgraph, strategy_mode='BRIDGING', allowed_ops=['object_to_event', 'vector_object'])
-                elif strategy_mode == 'LEAPING':
-                    self._process_event_stream(active_events, subgraph, strategy_mode='LEAPING', allowed_ops=['vector_event', 'context_event'], limit_top_k=3)
-                elif strategy_mode == 'TRIANGULATION':
-                    self._process_object_stream(active_objects, subgraph, strategy_mode='TRIANGULATION', allowed_ops=['relation', 'vector_object'])
-                else: 
-                    self._process_event_stream(active_events, subgraph, strategy_mode='BALANCED')
-                    self._process_object_stream(active_objects, subgraph, strategy_mode='BALANCED')
+                # 1. Expand Events (Structure + Vector)
+                for event in active_events:
+                    self._op_event_to_object(event, subgraph)
+                    self._op_vector_event_to_event(event, subgraph)
+                
+                # 2. Expand Objects (Structure + Relation + Vector)
+                for obj in active_objects:
+                    self._op_object_to_event(obj, subgraph)
+                    self._op_relation_expansion(obj, subgraph)
+                    self._op_vector_object_to_object(obj, subgraph)
                 
                 subgraph.update_iteration_stats()
             
-            self._print_graph_health(f"After Expansion (Iter {i+1})")
 
             # Merging
             self._check_and_merge_subgraphs()
-            self._print_graph_health(f"After Merging (Iter {i+1})")
             
             # Pruning
             self._adaptive_pruning()
-            self._print_graph_health(f"After Pruning (Iter {i+1})")
             
             # Evaluation
             if time_reference:
                 self._log_iteration_evaluation(f"iteration_{self.current_iteration}", time_reference)
-                self._print_graph_health(f"After Eval/Healing (Iter {i+1})")
             
             # Convergence
             current_subgraph_count = len([sg for sg in self.subgraphs if len(sg.nodes) > 0])
@@ -488,6 +427,10 @@ class GraphEngine:
         # 3. Post-Processing
         print(f"\n--- Post-Processing ---")
         self._finalize_all_subgraphs()
+
+        print("\n📊 Operation Statistics (Diagnosis):")
+        for op, stats in self._op_stats.items():
+            print(f"  - {op}: Attempted {stats['attempted']} -> Added {stats['added']}")
         
         valid_subgraphs = [sg for sg in self.subgraphs if len(sg.nodes) > 0]
         if not valid_subgraphs:
@@ -506,100 +449,6 @@ class GraphEngine:
         
         return answer, final_subgraphs
 
-    def _print_graph_health(self, label: str):
-        """Helper to diagnose where nodes are disappearing"""
-        print(f"📊 HEALTH [{label}]:")
-        
-        # --- FIXED: STOP IF LIST IS EMPTY ---
-        if not self.subgraphs:
-            print("❌ CRITICAL: Subgraph list is EMPTY!")
-            print("🛑 Pausing execution.")
-            breakpoint() 
-            return
-            
-        any_dead = False
-        for idx, sg in enumerate(self.subgraphs):
-            n_events = len(sg.get_nodes_by_type('event'))
-            n_objects = len(sg.get_nodes_by_type('object'))
-            total = len(sg.nodes)
-            
-            if total == 0:
-                status = "💀 DEAD"
-                any_dead = True
-                print(f"   - SG {idx} ({sg.id}): {total} nodes ({n_events}E, {n_objects}O) -> {status}")
-            else:
-                status = "✅ ALIVE"
-                print(f"   - SG {idx} ({sg.id}): {total} nodes ({n_events}E, {n_objects}O) -> {status}")
-        
-        # --- FIXED: STOP IF SUBGRAPH DIED ---
-        if any_dead:
-            print(f"\n❌ CRITICAL: Subgraph death detected during step: '{label}'")
-            print("🛑 Pausing execution.")
-            breakpoint()
-
-    # ------------------------------------------------------------------
-    # Dispatchers
-    # ------------------------------------------------------------------
-    def _process_event_stream(self, events: List[Node], subgraph: Subgraph, 
-                             strategy_mode: str = 'BALANCED',
-                             allowed_ops: List[str] = None, 
-                             limit_top_k: int = None):
-        """
-        Process events with strategy-aware operation filtering.
-        
-        Args:
-            strategy_mode: Current strategy for dynamic trust adjustment
-            allowed_ops: List of allowed operations (filters execution)
-            limit_top_k: If set, only process top K highest-scoring events
-        """
-        # Default to all operations if not specified
-        if allowed_ops is None:
-            allowed_ops = ['event_to_object', 'context_event', 'vector_event']
-        
-        # Apply TOP-K filtering (used in LEAPING mode)
-        if limit_top_k is not None:
-            events = sorted(events, key=lambda e: e.score, reverse=True)[:limit_top_k]
-        
-        # Process events with filtered operations
-        for event in events:
-            # if event.score < 0.15: continue
-            
-            # Execute only allowed operations
-            if 'event_to_object' in allowed_ops:
-                self._op_event_to_object(event, subgraph, strategy_mode)
-            if 'context_event' in allowed_ops:
-                self._op_context_event_expansion(event, subgraph, strategy_mode)
-            if 'vector_event' in allowed_ops:
-                self._op_vector_event_to_event(event, subgraph, strategy_mode)
-
-    def _process_object_stream(self, objects: List[Node], subgraph: Subgraph,
-                               strategy_mode: str = 'BALANCED',
-                               allowed_ops: List[str] = None,
-                               limit_top_k: int = None):
-        """
-        Process objects with strategy-aware operation filtering.
-        
-        Args:
-            strategy_mode: Current strategy for dynamic trust adjustment
-            allowed_ops: List of allowed operations (filters execution)
-            limit_top_k: If set, only process top K highest-scoring objects
-        """
-        # Default to all operations if not specified
-        if allowed_ops is None:
-            allowed_ops = ['object_to_event', 'relation', 'vector_object']
-        
-        # Apply TOP-K filtering if specified
-        if limit_top_k is not None:
-            objects = sorted(objects, key=lambda o: o.score, reverse=True)[:limit_top_k]
-        
-        # Process objects with filtered operations
-        for obj in objects:
-            if 'object_to_event' in allowed_ops:
-                self._op_object_to_event(obj, subgraph, strategy_mode)
-            if 'relation' in allowed_ops:
-                self._op_relation_expansion(obj, subgraph, strategy_mode)
-            if 'vector_object' in allowed_ops:
-                self._op_vector_object_to_object(obj, subgraph, strategy_mode)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -619,8 +468,8 @@ class GraphEngine:
     # ------------------------------------------------------------------
     # Operations
     # ------------------------------------------------------------------
-    def _op_event_to_object(self, source: Node, subgraph: Subgraph, strategy_mode: str = 'BALANCED'):
-        # Check KG cache first
+    # 1. Event -> Object (Name: 'event_object')
+    def _op_event_to_object(self, source: Node, subgraph: Subgraph):
         if source.id in self._kg_query_cache['objects_in_event']:
             kg_ids = set(self._kg_query_cache['objects_in_event'][source.id])
             self._cache_stats['kg_queries']['objects_in_event']['hits'] += 1
@@ -629,25 +478,17 @@ class GraphEngine:
             self._kg_query_cache['objects_in_event'][source.id] = list(kg_ids)
             self._cache_stats['kg_queries']['objects_in_event']['misses'] += 1
         
-        ctx_ids = self._get_context_neighbors(source.id, 'event_to_object')
-        obj_ids = kg_ids.union(ctx_ids)
-        
-        hub_size = len(obj_ids)
-        if hub_size == 0:
-            print(f"  [EVENT_TO_OBJECT] Event {source.id} has no objects")
-            return
+        hub_size = len(kg_ids)
+        if hub_size == 0: return
 
-        raw_energy = self.scorer.calculate_energy_transfer(
-            source_score=source.score, op_type='event_to_object', 
-            strategy_mode=strategy_mode, current_iteration=self.current_iteration,
-            hub_size=hub_size
+        energy = self.scorer.calculate_energy_transfer(
+            source.score, 'event_object', self.current_iteration, hub_size=hub_size
         )
+        for oid in kg_ids:
+            self._update_or_create_node(oid, 'object', energy, subgraph, source, 'event_object')
 
-        for oid in obj_ids:
-            self._update_or_create_node(oid, 'object', raw_energy, subgraph, source, 'event_to_object')
-
-    def _op_object_to_event(self, source: Node, subgraph: Subgraph, strategy_mode: str = 'BALANCED'):
-        # Check KG cache for events containing this object
+    # 2. Object -> Event (Name: 'object_event')
+    def _op_object_to_event(self, source: Node, subgraph: Subgraph):
         if source.id in self._kg_query_cache['events_with_object']:
             kg_ids = set(self._kg_query_cache['events_with_object'][source.id])
             self._cache_stats['kg_queries']['events_with_object']['hits'] += 1
@@ -656,7 +497,6 @@ class GraphEngine:
             self._kg_query_cache['events_with_object'][source.id] = list(kg_ids)
             self._cache_stats['kg_queries']['events_with_object']['misses'] += 1
         
-        # Check KG cache for global count
         if source.id in self._kg_query_cache['event_count_per_object']:
             global_count = self._kg_query_cache['event_count_per_object'][source.id]
             self._cache_stats['kg_queries']['event_count_per_object']['hits'] += 1
@@ -665,110 +505,70 @@ class GraphEngine:
             self._kg_query_cache['event_count_per_object'][source.id] = global_count
             self._cache_stats['kg_queries']['event_count_per_object']['misses'] += 1
         
-        if len(kg_ids) == 0:
-            print(f"  [OBJECT_TO_EVENT] Object {source.id} appears in no events")
-            return
+        if len(kg_ids) == 0: return
         
-        raw_energy = self.scorer.calculate_energy_transfer(
-            source_score=source.score, op_type='object_to_event', 
-            strategy_mode=strategy_mode, current_iteration=self.current_iteration,
-            global_uniqueness=global_count
+        energy = self.scorer.calculate_energy_transfer(
+            source.score, 'object_event', self.current_iteration, global_uniqueness=global_count
         )
-
         for eid in kg_ids:
-            self._update_or_create_node(eid, 'event', raw_energy, subgraph, source, 'object_to_event')
+            self._update_or_create_node(eid, 'event', energy, subgraph, source, 'object_event')
 
-    def _op_relation_expansion(self, source: Node, subgraph: Subgraph, strategy_mode: str = 'BALANCED'):
-            """
-            [UPDATED] Object → Relation Node → Target Object via Knowledge Graph (Structural).
-            Also includes Context Graph history lookup.
-            """
-            # 1. Relation View from Knowledge Graph (AVA)
-            # We cache the actual Relation Nodes to preserve edge metadata
-            if source.id in self._kg_query_cache['relations_for_object']:
-                relations = self._kg_query_cache['relations_for_object'][source.id]
-                self._cache_stats['kg_queries']['relations_for_object']['hits'] += 1
-            else:
-                # Calls get_relations_containing_object from graph_interfaces.py
-                relations = self.kg.get_relations_containing_object(source.id)
-                self._kg_query_cache['relations_for_object'][source.id] = relations
-                self._cache_stats['kg_queries']['relations_for_object']['misses'] += 1
-            
-            # Process KG Relations
-            if relations:
-                # Energy for the Relation Node itself
-                hub_size = len(relations)
-                energy_rel = self.scorer.calculate_energy_transfer(
-                    source.score, 'relation',  
-                    strategy_mode=strategy_mode, current_iteration=self.current_iteration,
-                    hub_size=hub_size
-                )
-                
-                for rel_node in relations:
-                    # A. Add the Relation Node (The "Bridge")
-                    # We use 'has_relation' to link Source -> RelationNode
-                    if self._update_or_create_node(rel_node.id, 'relation', energy_rel, subgraph, source, 'has_relation', node_data=rel_node):
-                        
-                        # B. Find the Target Object ID
-                        # Relation metadata contains {entity1: "id", entity2: "id", ...}
-                        e1 = rel_node.metadata.get('entity1')
-                        e2 = rel_node.metadata.get('entity2')
-                        
-                        target_id = e2 if e1 == source.id else e1
-                        
-                        if target_id and target_id != source.id:
-                            added_rel_node = subgraph.get_node(rel_node.id)
-                            current_rel_score = added_rel_node.score if added_rel_node else energy_rel
-                            energy_target = self.scorer.calculate_energy_transfer(
-                                current_rel_score, 'relation_target',
-                                strategy_mode=strategy_mode, current_iteration=self.current_iteration
-                            )
-                            # Link RelationNode -> TargetObject
-                            self._update_or_create_node(target_id, 'object', energy_target, subgraph, rel_node, 'relation_target')
-
-            # 2. Relation View from Context Graph (History)
-            # Keeps your original logic for direct Object->Object links found in previous queries
-            target_ids_ctx = self._get_context_neighbors(source.id, 'relation')
-            if target_ids_ctx:
-                energy_ctx = self.scorer.calculate_energy_transfer(
-                    source.score, 'context_relation', 
-                    strategy_mode=strategy_mode, current_iteration=self.current_iteration
-                )
-                for tid in target_ids_ctx:
-                    self._update_or_create_node(tid, 'object', energy_ctx, subgraph, source, 'context_relation')
-
-    def _op_vector_relation_expansion(self, source: Node, subgraph: Subgraph, strategy_mode: str = 'BALANCED'):
-        """
-        [PLACEHOLDER] Future Operation:
-        Map Object -> Relation (A) -> [Vector Search] -> Relation (B) -> Target Object
+    # 3. Structure Object (Name: 'structure_object')
+    def _op_relation_expansion(self, source: Node, subgraph: Subgraph):
+        # 1. Fetch Relation Data (used to find targets, not added as nodes)
+        if source.id in self._kg_query_cache['relations_for_object']:
+            relations = self._kg_query_cache['relations_for_object'][source.id]
+            self._cache_stats['kg_queries']['relations_for_object']['hits'] += 1
+        else:
+            relations = self.kg.get_relations_containing_object(source.id)
+            self._kg_query_cache['relations_for_object'][source.id] = relations
+            self._cache_stats['kg_queries']['relations_for_object']['misses'] += 1
         
-        This will allow hopping between similar relations (e.g., "holding cup" -> "holding bottle")
-        even if they are not structurally connected.
-        """
-        # TODO: Implement relation-to-relation vector search
-        pass
-
-    def _op_context_event_expansion(self, source: Node, subgraph: Subgraph, strategy_mode: str = 'BALANCED'):
-        """Event → Event via Context Graph only (no KG structure)"""
-        target_ids = self._get_context_neighbors(source.id, 'event_to_event')
-        if not target_ids:
+        if not relations:
             return
+
+        # 2. Calculate Energy for the Target Objects
+        # We treat this as a 1-hop structural connection
+        hub_size = len(relations)
+        energy_target = self.scorer.calculate_energy_transfer(
+            source.score, 'structure_object', 
+            current_iteration=self.current_iteration, 
+            hub_size=hub_size
+        )
+        
+        for rel_node in relations:
+            # Check metadata to find the OTHER object ID
+            e1 = rel_node.metadata.get('entity1')
+            e2 = rel_node.metadata.get('entity2')
+            
+            # Identify target
+            if e1 == source.id:
+                target_id = e2
+            elif e2 == source.id:
+                target_id = e1
+            else:
+                continue # Should not happen given get_relations logic
+                
+            if target_id and target_id != source.id:
+                # Add Target Object Node directly
+                # Edge Type: 'structure_object'
+                self._update_or_create_node(target_id, 'object', energy_target, subgraph, source, 'structure_object')
+
+    # 4. Context Event (Name: 'context_event')
+    def _op_context_event_expansion(self, source: Node, subgraph: Subgraph):
+        target_ids = self._get_context_neighbors(source.id, 'context_event')
+        if not target_ids: return
 
         energy = self.scorer.calculate_energy_transfer(
-            source.score, 'context_event_to_event', 
-            strategy_mode=strategy_mode, current_iteration=self.current_iteration
+            source.score, 'context_event', self.current_iteration
         ) 
-
         for tid in target_ids:
-            self._update_or_create_node(tid, 'event', energy, subgraph, source, 'context_event_to_event')
+            self._update_or_create_node(tid, 'event', energy, subgraph, source, 'context_event')
 
-    def _op_vector_object_to_object(self, source: Node, subgraph: Subgraph, strategy_mode: str = 'BALANCED'):
-        # Validate embedding before vector search
-        if not self._is_valid_embedding(source.embedding):
-            # Skip vector search if embedding is invalid
-            return
+    # 5. Vector Object (Name: 'vector_object')
+    def _op_vector_object_to_object(self, source: Node, subgraph: Subgraph):
+        if not self._is_valid_embedding(source.embedding): return
         
-        # Check vector search cache (node-based fast path)
         if source.id in self._vector_search_cache['object_to_object_by_node']:
             results = self._vector_search_cache['object_to_object_by_node'][source.id]
             self._cache_stats['vector_searches']['object_to_object']['hits'] += 1
@@ -779,29 +579,15 @@ class GraphEngine:
         
         for res_node in results:
             energy = self.scorer.calculate_energy_transfer(
-                source.score, 'vector_object', strategy_mode=strategy_mode,
-                current_iteration=self.current_iteration,
-                node_embedding=res_node.embedding,
-                parent_embedding=source.embedding
+                source.score, 'vector_object', self.current_iteration,
+                node_embedding=res_node.embedding, parent_embedding=source.embedding
             )
             self._update_or_create_node(res_node.id, 'object', energy, subgraph, source, 'vector_object', node_data=res_node)
 
-    def _is_valid_embedding(self, embedding) -> bool:
-        """Check if embedding is valid (not None and no NaN values)."""
-        if embedding is None:
-            return False
-        if isinstance(embedding, np.ndarray):
-            if np.any(np.isnan(embedding)) or np.any(np.isinf(embedding)):
-                return False
-        return True
-
-    def _op_vector_event_to_event(self, source: Node, subgraph: Subgraph, strategy_mode: str = 'BALANCED'):
-        # Validate embedding before vector search
-        if not self._is_valid_embedding(source.embedding):
-            # Skip vector search if embedding is invalid
-            return
+    # 6. Vector Event (Name: 'vector_event')
+    def _op_vector_event_to_event(self, source: Node, subgraph: Subgraph):
+        if not self._is_valid_embedding(source.embedding): return
         
-        # Check vector search cache (node-based fast path)
         if source.id in self._vector_search_cache['event_to_event_by_node']:
             results = self._vector_search_cache['event_to_event_by_node'][source.id]
             self._cache_stats['vector_searches']['event_to_event']['hits'] += 1
@@ -812,80 +598,39 @@ class GraphEngine:
         
         for res_node in results:
             energy = self.scorer.calculate_energy_transfer(
-                source.score, 'vector_event', strategy_mode=strategy_mode,
-                current_iteration=self.current_iteration,
-                node_embedding=res_node.embedding,
-                parent_embedding=source.embedding
+                source.score, 'vector_event', self.current_iteration,
+                node_embedding=res_node.embedding, parent_embedding=source.embedding
             )
             self._update_or_create_node(res_node.id, 'event', energy, subgraph, source, 'vector_event', node_data=res_node)
 
-    # ------------------------------------------------------------------
-    # Post-Processing Logic (Corrected for Deep Paths)
-    # ------------------------------------------------------------------
-    def _finalize_subgraph_structure(self, subgraph: Subgraph):
+    def _op_vector_relation_expansion(self, source: Node, subgraph: Subgraph):
         """
-        Creates edges between Events that are connected by a path 
-        containing ONLY Object nodes (of any length).
+        [PLACEHOLDER] Future Operation:
+        Map Object -> Relation (A) -> [Vector Search] -> Relation (B) -> Target Object
         
-        Algorithm: BFS from every Event node, traversing only Object nodes.
+        This will allow hopping between similar relations (e.g., "holding cup" -> "holding bottle")
+        even if they are not structurally connected.
         """
-        # 1. Build Adjacency List for the current subgraph (Undirected view for connectivity)
-        adj: Dict[str, Set[str]] = {node_id: set() for node_id in subgraph.nodes}
-        for edge in subgraph.edges:
-            if edge.source_id in adj and edge.target_id in adj:
-                adj[edge.source_id].add(edge.target_id)
-                adj[edge.target_id].add(edge.source_id)
+        # TODO: Implement relation-to-relation vector search
+        pass
 
-        events = subgraph.get_nodes_by_type('event')
-        existing_edges = set((e.source_id, e.target_id) for e in subgraph.edges)
-
-        # 2. BFS from each event to find other reachable events via Objects
-        for start_event in events:
-            queue = deque([(start_event.id, 0)]) # (current_id, path_length)
-            visited = {start_event.id}
-            
-            while queue:
-                curr_id, dist = queue.popleft()
-                
-                # If we moved more than 0 steps and hit an Event, we found a link
-                if curr_id != start_event.id:
-                    curr_node = subgraph.get_node(curr_id)
-                    if curr_node and curr_node.type == 'event':
-                        # Found an event! Create Mutual Link if it doesn't exist
-                        if (start_event.id, curr_id) not in existing_edges:
-                            # Score logic: Decay based on path length
-                            link_score = 0.8 * (0.9 ** dist) 
-                            subgraph.add_edge(Edge(start_event.id, curr_id, 'mutual_object_link', link_score))
-                            existing_edges.add((start_event.id, curr_id))
-                        continue # Stop this branch, don't go through the event to other objects
-
-                # Explore neighbors
-                for neighbor_id in adj[curr_id]:
-                    if neighbor_id not in visited:
-                        neighbor_node = subgraph.get_node(neighbor_id)
-                        if not neighbor_node: continue
-                        
-                        # Only traverse through OBJECTS. 
-                        # Or if we hit an EVENT, we process it (above) but don't add to queue (stop branch)
-                        if neighbor_node.type == 'object':
-                            visited.add(neighbor_id)
-                            queue.append((neighbor_id, dist + 1))
-                        elif neighbor_node.type == 'event':
-                            # We still want to "visit" the event to check the condition above,
-                            # but we do NOT add it to the queue to continue traversal.
-                            # We just add to queue to be processed by the check at the start of loop.
-                            visited.add(neighbor_id)
-                            queue.append((neighbor_id, dist + 1))
-
+    def _is_valid_embedding(self, embedding) -> bool:
+        """Check if embedding is valid (not None and no NaN values)."""
+        if embedding is None:
+            return False
+        if isinstance(embedding, np.ndarray):
+            if np.any(np.isnan(embedding)) or np.any(np.isinf(embedding)):
+                return False
+        return True
     # ------------------------------------------------------------------
     # Core Update Logic
     # ------------------------------------------------------------------
     def _update_or_create_node(self, node_id, node_type, incoming_energy, subgraph, parent_node, op_type, node_data=None):
         if node_id == parent_node.id: return False
+        
+        self._op_stats[op_type]['attempted'] += 1
 
-        global_counts = get_global_system_counts(self.subgraphs)
-        balance_mult = self.scorer.get_balance_multiplier(node_type, global_counts)
-        final_energy = incoming_energy * balance_mult
+        final_energy = incoming_energy
 
         is_newly_created = False
         target_node = subgraph.get_node(node_id)
@@ -893,37 +638,26 @@ class GraphEngine:
         if target_node:
             old_score = target_node.score
             new_score = self.scorer.accumulate_score(old_score, final_energy)
-            
-            # Update score even if small change (important for vector edges with damped energy)
             target_node.score = new_score
             subgraph.add_edge(Edge(parent_node.id, node_id, op_type, final_energy))
             
             if (new_score - old_score) < 0.001: 
                 return False
         else:
-            # Fetch full node data with metadata if not provided
-            if node_data:
-                new_node = node_data
-                new_node.score = final_energy
-            else:
-                # Fetch from database
-                if node_type == 'event':
-                    new_node = self.kg.get_event_node_by_id(node_id)
-                elif node_type == 'object':
-                    new_node = self.kg.get_object_node_by_id(node_id)
-                else:
-                    new_node = Node(id=node_id, type=node_type, score=final_energy)
-                
-                # If node doesn't exist in database, create a minimal node
-                if new_node is None:
-                    new_node = Node(id=node_id, type=node_type, score=final_energy)
-                else:
-                    new_node.score = final_energy
+            if node_data: new_node = node_data
+            elif node_type == 'event': new_node = self.kg.get_event_node_by_id(node_id)
+            elif node_type == 'object': new_node = self.kg.get_object_node_by_id(node_id)
+            else: new_node = None
+            
+            if new_node is None: new_node = Node(id=node_id, type=node_type, score=final_energy)
+            else: new_node.score = final_energy
             
             subgraph.add_node(new_node)
             subgraph.add_edge(Edge(parent_node.id, node_id, op_type, final_energy))
             target_node = new_node
             is_newly_created = True
+
+        self._op_stats[op_type]['added'] += 1
 
         if is_newly_created:
             self._instant_local_triangulation(target_node, subgraph)
@@ -939,9 +673,7 @@ class GraphEngine:
 
         if new_node.type == 'event':
             # 1. Check KG Objects (Structure)
-            # Use original_id if available for KG lookup
-            event_id_for_lookup = new_node.metadata.get('original_id', new_node.id)
-            kg_obj_ids = self.kg.get_objects_in_event(event_id_for_lookup)
+            kg_obj_ids = self.kg.get_objects_in_event(new_node.id)
             if kg_obj_ids:
                 hub_size = len(kg_obj_ids)
                 energy = self.scorer.calculate_energy_transfer(
@@ -1050,16 +782,13 @@ class GraphEngine:
             # Group seeds by connectivity (also returns connections to avoid re-querying KG)
             seed_groups, seed_connections = self._group_connected_seeds(init_events, init_objects)
             
-            # Create separate subgraph for each connected group
-            initial_counts = {'event': len(init_events), 'object': len(init_objects)}
             for group_id, (events, objects) in enumerate(seed_groups):
                 sg = Subgraph(id=f"kg_seed_group_{group_id}")
             
                 # Add nodes with proper scoring and mark as seeds
                 for node in events + objects:
-                    balance_mult = self.scorer.get_balance_multiplier(node.type, initial_counts)
                     initial_energy = node.score * self.scorer.trust_map['init'] 
-                    node.score = self.scorer.accumulate_score(0.0, initial_energy * balance_mult)
+                    node.score = self.scorer.accumulate_score(0.0, initial_energy)
                     node.metadata['is_seed'] = True  # Mark as seed for pruning protection
                     sg.add_node(node)
                 
@@ -1069,32 +798,6 @@ class GraphEngine:
                 self.subgraphs.append(sg)
                 print(f"Created subgraph '{sg.id}' with {len(sg.nodes)} seeds ({len(events)} events, {len(objects)} objects)")
 
-
-        if len(self.subgraphs) == 0:
-            print("❌ CRITICAL: Function finished but created 0 subgraphs.")
-            print("🛑 Pausing execution.")
-            # breakpoint() # <--- CHECK HERE: Grouping logic failed or context missing.
-            return
-
-        # Retrieve context subgraphs from previous queries as REFERENCES (not active subgraphs)
-        # Use KEYWORD embedding (not raw query embedding)
-        if self.context_graph is not None and self.current_context_key_embedding is not None:
-            self.retrieved_context_subgraphs = self.context_graph.search_context(
-                self.current_context_key_embedding, top_k=3
-            )
-        else:
-            self.retrieved_context_subgraphs = []
-        
-        if self.retrieved_context_subgraphs:
-            print(f"📂 Retrieved {len(self.retrieved_context_subgraphs)} context subgraphs from past queries")
-            for ctx_sg in self.retrieved_context_subgraphs:
-                print(f"  - Context '{ctx_sg.id}': {len(ctx_sg.nodes)} nodes, {len(ctx_sg.edges)} edges")
-        else:
-            if self.context_graph is None:
-                # print("📂 Context graph disabled - no cross-query memory")
-                pass
-            else:
-                print("📂 No context subgraphs retrieved (first query or no matches)")
 
     def _group_connected_seeds(self, init_events: List[Node], init_objects: List[Node]) -> Tuple[List[Tuple[List[Node], List[Node]]], Dict[str, Set[str]]]:
         """
@@ -1113,8 +816,7 @@ class GraphEngine:
         # This processes all events in init_events and finds their objects
         for event in init_events:
             # Use original_id if available for KG lookup
-            event_id_for_lookup = event.metadata.get('original_id', event.id)
-            obj_ids = self.kg.get_objects_in_event(event_id_for_lookup)
+            obj_ids = self.kg.get_objects_in_event(event.id)
             for oid in obj_ids:
                 if oid in all_seeds:
                     seed_connections[event.id].add(oid)
@@ -1195,8 +897,7 @@ class GraphEngine:
             for oid in connected_obj_ids:
                 if subgraph.has_node(oid):
                     # Still need to query for hub_size calculation
-                    event_id_for_lookup = event.metadata.get('original_id', event.id)
-                    all_obj_ids = self.kg.get_objects_in_event(event_id_for_lookup)
+                    all_obj_ids = self.kg.get_objects_in_event(event.id)
                     energy = self.scorer.calculate_energy_transfer(
                         event.score, 'event_to_object', 
                         current_iteration=self.current_iteration, hub_size=len(all_obj_ids)
@@ -1346,6 +1047,10 @@ class GraphEngine:
                     existing_edges_global.add(tuple(sorted((e.source_id, e.target_id))))
 
         mutual_links_created = 0
+        MAX_HOPS = 3
+
+        # Get base score from Scorer config
+        mutual_link_base_score = self.scorer.trust_map.get('mutual_object_link', 0.8)
         
         # 3. BFS Logic
         for start_node in all_events:
@@ -1356,7 +1061,7 @@ class GraphEngine:
                 curr_id, dist = queue.popleft()
                 
                 # Constraint: Don't go too deep (e.g., max 3 hops: E->O->O->E)
-                if dist > 3:
+                if dist > MAX_HOPS:
                     continue
 
                 # If we moved and hit another EVENT, we found a link
@@ -1373,7 +1078,7 @@ class GraphEngine:
                         # Valid Mutual Link!
                         pair_key = tuple(sorted((start_node.id, curr_id)))
                         if pair_key not in existing_edges_global:
-                            link_score = 0.8 * (0.9 ** dist)
+                            link_score = mutual_link_base_score * (0.9 ** dist)
                             
                             # Add to the subgraph containing start_node
                             for target_sg in self.subgraphs:
@@ -1395,144 +1100,61 @@ class GraphEngine:
         self._check_and_merge_subgraphs()
     
     # ------------------------------------------------------------------
-    # Shape-Aware Strategy Selection
-    # ------------------------------------------------------------------
-    def _calculate_mass_ratio(self, subgraph: Subgraph) -> float:
-        """Calculate Events / Objects ratio"""
-        events = len(subgraph.get_nodes_by_type('event'))
-        objects = len(subgraph.get_nodes_by_type('object'))
-        
-        if objects == 0:
-            return float('inf') if events > 0 else 1.0
-        
-        return events / objects
-    
-    def _calculate_density(self, subgraph: Subgraph) -> float:
-        """Calculate graph density: 2 * Edges / (Nodes * (Nodes-1))"""
-        nodes = len(subgraph.nodes)
-        edges = len(subgraph.edges)
-        
-        if nodes <= 1:
-            return 0.0
-        
-        max_possible_edges = nodes * (nodes - 1) / 2
-        return (2 * edges) / (nodes * (nodes - 1)) if max_possible_edges > 0 else 0.0
-    
-    def _determine_strategy(self, subgraph: Subgraph) -> str:
-        """
-        Determine the strategy mode based on graph shape metrics.
-        
-        Returns one of: 'GROUNDING', 'BRIDGING', 'LEAPING', 'TRIANGULATION', 'BALANCED'
-        """
-        if len(subgraph.nodes) < 20:
-            return 'BALANCED'
-        
-        # Calculate shape metrics
-        mass_ratio = self._calculate_mass_ratio(subgraph)
-        density = self._calculate_density(subgraph)
-        velocity = subgraph.get_velocity()
-        
-        # Priority-based mode selection
-        
-        # Mode A: GROUNDING (too many events, few objects - "ghostly verbs")
-        if mass_ratio > 1.2:
-            return 'GROUNDING'
-        
-        # Mode B: BRIDGING (too many objects, few events - "disconnected nouns")
-        if mass_ratio < 0.6:
-            return 'BRIDGING'
-        
-        # Mode C: LEAPING (dense cluster + stagnant - "explored fully, need to jump")
-        # High density threshold: 0.3, Low velocity threshold: 0.05
-        if density > 0.3 and velocity < 0.05:
-            return 'LEAPING'
-        
-        # Mode D: TRIANGULATION (loose chain - "need cross-validation")
-        # Low density threshold: 0.1
-        if density < 0.1:
-            return 'TRIANGULATION'
-        
-        # Default: BALANCED (healthy graph state)
-        return 'BALANCED'
-    
-    # ------------------------------------------------------------------
     # Steiner Tree Pruning
     # ------------------------------------------------------------------
     def _should_prune_subgraph(self, subgraph: Subgraph) -> bool:
-        """Adaptive check if pruning is needed for this subgraph"""
+        """Adaptive check if pruning is needed"""
         config = self.pruning_config
+        total = len(subgraph.nodes)
         
-        # Count nodes by type
-        event_count = len(subgraph.get_nodes_by_type('event'))
-        object_count = len(subgraph.get_nodes_by_type('object'))
-        edge_count = len(subgraph.edges)
-        total_nodes = len(subgraph.nodes)
-
-        if total_nodes < 20:
-            return False
+        # Don't prune tiny graphs
+        if total < 20: return False
         
-        # Check size thresholds (AGGRESSIVE)
-        if total_nodes > config['max_total_nodes']:
-            return True
-        if event_count > config['max_event_nodes']:
-            return True
-        if object_count > config['max_object_nodes']:
-            return True
-        if edge_count > config['max_edges']:
-            return True
+        # Trigger based on strict total budget
+        if total > config['max_total_nodes']: return True
         
-        # Check score saturation
-        saturated_count = sum(
-            1 for node in subgraph.nodes.values()
-            if node.score >= config['score_saturation_threshold']
-        )
-        if saturated_count > config['saturation_count_trigger']:
-            return True
+        # Trigger if edges are exploding (prevent loops)
+        if len(subgraph.edges) > config['max_edges']: return True
         
         return False
     
     def _identify_terminals(self, subgraph: Subgraph) -> Set[str]:
         """
-        Identify high-value nodes that MUST be kept using Rank-Based Selection.
+        Identify high-value nodes using Dynamic Ratio Selection.
         
-        NEW LOGIC (Score-Saturation Proof):
-        - Select TOP N nodes by score (budget enforcement)
-        - Seeds are always protected as "Honorary Terminals"
-        - Guarantees exact budget compliance regardless of score distribution
+        - Keeps Seeds.
+        - Fills remaining budget with highest-scoring nodes (Event OR Object).
+        - Does NOT enforce fixed event/object counts.
         """
         config = self.pruning_config
+        max_total = config['max_total_nodes']
         terminals = set()
         
-        # Separate nodes by type
-        events = [n for n in subgraph.nodes.values() if n.type == 'event']
-        objects = [n for n in subgraph.nodes.values() if n.type == 'object']
-        
-        # Identify seeds (honorary terminals - always protected)
-        seed_events = [n for n in events if n.metadata.get('is_seed', False)]
-        seed_objects = [n for n in objects if n.metadata.get('is_seed', False)]
-        
-        for seed in seed_events + seed_objects:
+        # 1. Identify seeds (Always keep)
+        seeds = [n for n in subgraph.nodes.values() if n.metadata.get('is_seed', False)]
+        for seed in seeds:
             terminals.add(seed.id)
+            
+        # 2. Reserve buffer for Steiner Bridges (20% or min 5)
+        # This ensures we have space to connect the high-scoring nodes later
+        bridge_buffer = max(5, int(max_total * 0.2))
+        available_slots = max_total - len(terminals) - bridge_buffer
         
-        # Rank-based selection: TOP N non-seed nodes by score
-        non_seed_events = [n for n in events if not n.metadata.get('is_seed', False)]
-        non_seed_objects = [n for n in objects if not n.metadata.get('is_seed', False)]
+        if available_slots <= 0:
+            return terminals
+            
+        # 3. Dynamic Selection: Sort ALL non-seed nodes by score
+        # Events and Objects compete fairly based on relevance
+        candidates = [
+            n for n in subgraph.nodes.values() 
+            if not n.metadata.get('is_seed', False)
+        ]
+        candidates.sort(key=lambda n: n.score, reverse=True)
         
-        # Sort by score descending
-        non_seed_events.sort(key=lambda n: n.score, reverse=True)
-        non_seed_objects.sort(key=lambda n: n.score, reverse=True)
-        
-        # Take TOP N (budget enforcement)
-        max_event_budget = config['max_event_nodes']
-        max_object_budget = config['max_object_nodes']
-        
-        # Select top non-seeds (note: seeds don't count against budget)
-        for node in non_seed_events[:max_event_budget]:
+        # Take top N candidates
+        for node in candidates[:available_slots]:
             terminals.add(node.id)
-        
-        for node in non_seed_objects[:max_object_budget]:
-            terminals.add(node.id)
-        
+            
         return terminals
     
     def _find_steiner_nodes(self, subgraph: Subgraph, terminals: Set[str], max_count: int) -> Set[str]:
@@ -1685,18 +1307,12 @@ class GraphEngine:
         for subgraph in self.subgraphs:
             if self._should_prune_subgraph(subgraph):
                 node_count = len(subgraph.nodes)
-                event_count = len(subgraph.get_nodes_by_type('event'))
-                object_count = len(subgraph.get_nodes_by_type('object'))
                 edge_count = len(subgraph.edges)
                 
                 # Log why pruning was triggered
                 reasons = []
                 if node_count > config['max_total_nodes']:
                     reasons.append(f"nodes>{config['max_total_nodes']}")
-                if event_count > config['max_event_nodes']:
-                    reasons.append(f"events>{config['max_event_nodes']}")
-                if object_count > config['max_object_nodes']:
-                    reasons.append(f"objects>{config['max_object_nodes']}")
                 if edge_count > config['max_edges']:
                     reasons.append(f"edges>{config['max_edges']}")
                 
@@ -1822,7 +1438,7 @@ class GraphEngine:
             print(f"✓ Selected top {len(final_selection)} subgraphs for Final Prompt.")
         elif selection_mode == 'budget':
             # Select best graphs fitting into ~300 nodes context window
-            final_selection = self.select_best_subgraphs(max_total_nodes_budget=300)
+            final_selection = self.select_best_subgraphs(max_total_nodes_budget=500)
             print(f"✓ Selected {len(final_selection)} subgraphs within budget for Final Prompt.")
         else:  # 'all'
             final_selection = self.subgraphs

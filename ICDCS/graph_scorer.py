@@ -10,21 +10,25 @@ class GraphScorer:
         self.base_decay = base_decay
         self.target_ratio = target_event_obj_ratio
         
-        # Policy: Trust factors for different operations
+        # Policy: EQUAL TRUST for all operations
         self.trust_map = {
             'init': 1.0,
-            'event_to_object': 0.9,    # Structure (Hub Penalty applies)
-            'object_to_event': 0.9,    # Structure (Uniqueness applies)
-            'vector_object': 0.6,       # Inference (Risky - Compass Rule)
-            'vector_event': 0.5,        # Inference (Bridge)
-
-            # RELATION VIEW (NEW)
-            'relation': 0.9,           # Object -> Relation Node (Explicit Structure)
-            'relation_target': 0.95,   # Relation Node -> Target Object (Pass-through, high trust)
             
-            # CONTEXT-BASED: Object↔Object and Event↔Event ONLY via Context (no KG structure)
-            'context_relation': 0.8,       # Object→Object from Context Graph
-            'context_event_to_event': 0.7  # Event→Event from Context Graph
+            # Structure
+            'event_to_object': 0.9, 
+            'object_to_event': 0.9,
+            
+            # Vector / Inference
+            'vector_object': 0.9,   
+            'vector_event': 0.9,    
+
+            # Relation (Structure)
+            'structure_object': 0.9, 
+            'relation': 0.9,
+            
+            # Post-Processing Links (NEW)
+            # This replaces the hardcoded '0.8' in finalize_subgraph
+            'mutual_object_link': 0.8  
         }
 
     def compute_similarity(self, vec_a, vec_b) -> float:
@@ -33,26 +37,9 @@ class GraphScorer:
         if len(vec_b.shape) == 1: vec_b = vec_b.reshape(1, -1)
         return float(cosine_similarity(vec_a, vec_b)[0][0])
 
-    def get_balance_multiplier(self, node_type: str, current_counts: Dict[str, int]) -> float:
-        """
-        The Thermostat: Maintains health of graph structure.
-        """
-        n_evt = max(1, current_counts.get('event', 0))
-        n_obj = max(1, current_counts.get('object', 0))
-        current_ratio = n_evt / n_obj
-        
-        if node_type == 'event':
-            # Boost events if they are scarce (Ratio < 0.33)
-            return 1.2 if current_ratio < self.target_ratio else 0.9
-        elif node_type == 'object':
-            # Suppress objects if they are abundant (Ratio > 0.33)
-            return 0.8 if current_ratio < self.target_ratio else 1.0
-        return 1.0
-
     def calculate_energy_transfer(self, 
                                   source_score: float, 
                                   op_type: str, 
-                                  strategy_mode: str = 'BALANCED',
                                   current_iteration: int = 1,
                                   hub_size: int = 1,
                                   global_uniqueness: int = 1,
@@ -63,34 +50,20 @@ class GraphScorer:
         Calculates how much 'Heat' flows from Parent -> Child based on heuristics.
         
         Args:
-            strategy_mode: Current graph exploration strategy ('GROUNDING', 'BRIDGING', 'LEAPING', 'TRIANGULATION', 'BALANCED')
-                          Affects trust multipliers dynamically.
             current_iteration: Current iteration number (for time-based damping)
         """
-        # 1. Base Energy with Dynamic Trust Adjustment
-        base_trust = self.trust_map.get(op_type, 0.5)
+        # 1. Base Energy with Uniform Trust
+        base_trust = self.trust_map.get(op_type, 0.9)
         
-        # Apply strategy-specific trust multipliers
-        if strategy_mode in ['GROUNDING', 'BRIDGING']:
-            # Structural modes: BOOST trust (we need these nodes to stabilize)
-            trust = base_trust * 1.12
-        elif strategy_mode == 'LEAPING':
-            # Inference mode: PENALIZE trust (only best matches should survive risky jumps)
-            trust = base_trust * 0.83
-        else:
-            # TRIANGULATION or BALANCED: Use base trust
-            trust = base_trust
-        
-        energy = source_score * self.base_decay * trust
-
+        energy = source_score * self.base_decay * base_trust
         # 2. Structural Penalties/Bonuses
         
         # A. Hub Penalty (Logarithmic) - For Event->Object
-        if (op_type == 'event_to_object' or op_type == 'relation') and hub_size > 1:
+        if (op_type == 'event_object' or op_type == 'structure_object') and hub_size > 1:
             energy /= math.log(hub_size + 1)
             
         # B. Uniqueness Bonus (Inverse Log) - For Object->Event
-        if op_type == 'object_to_event':
+        if op_type == 'object_event':
             safe_uniq = max(1, global_uniqueness)
             # Gentle boost for rare items, capped at 1.5x
             uniqueness_factor = 1.0 / (math.log(safe_uniq + 1) * 0.5)
