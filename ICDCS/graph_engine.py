@@ -78,13 +78,20 @@ class GraphEngine:
                  knowledge_graph: KnowledgeGraphInterface, 
                  context_graph: Optional[ContextGraphInterface] = None, 
                  scorer: Optional[GraphScorer] = None,
-                 llm = None):  # LLM for query rewriting/keyword extraction
+                 constrained_propagation: bool = False,
+                 top_k_events: int = 5,
+                 top_k_objects: int = 5,
         self.kg = knowledge_graph
         self.context_graph = context_graph
         self.scorer = scorer
         self.llm = llm
         # M4: Initialize query embedding storage
         self.query_embedding = None
+
+        # M1: Store constrained propagation settings
+        self.constrained_propagation = constrained_propagation
+        self.top_k_events = top_k_events
+        self.top_k_objects = top_k_objects
         
         # === PER-QUERY STATE (reset each search) ===
         self._reset_query_state()
@@ -473,8 +480,32 @@ class GraphEngine:
             # Expansion
             for subgraph in self.subgraphs[:]:
                 
-                active_events = subgraph.get_nodes_by_type('event')
-                active_objects = subgraph.get_nodes_by_type('object')
+                # ====================================================================
+                # M1: CONSTRAINED PROPAGATION
+                # ====================================================================
+                if self.constrained_propagation:
+                    # Get all nodes by type
+                    all_events = subgraph.get_nodes_by_type('event')
+                    all_objects = subgraph.get_nodes_by_type('object')
+                    
+                    # Sort by score descending (highest scores first)
+                    all_events.sort(key=lambda n: n.score, reverse=True)
+                    all_objects.sort(key=lambda n: n.score, reverse=True)
+                    
+                    # Take only top-k
+                    active_events = all_events[:self.top_k_events]
+                    active_objects = all_objects[:self.top_k_objects]
+                    
+                    # Debug output
+                    print(f"  [M1] Constrained propagation: "
+                        f"{len(active_events)}/{len(all_events)} events, "
+                        f"{len(active_objects)}/{len(all_objects)} objects")
+                else:
+                    # Original behavior: expand from ALL nodes
+                    active_events = subgraph.get_nodes_by_type('event')
+                    active_objects = subgraph.get_nodes_by_type('object')
+
+
                 
                 # 1. Expand Events (Structure + Vector)
                 for event in active_events:
