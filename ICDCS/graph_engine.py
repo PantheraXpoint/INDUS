@@ -122,25 +122,25 @@ class GraphEngine:
 
         # Pruning Configuration
         self.pruning_config = {
-            # STRICT BUDGET: 50 NODES
-            'max_total_nodes': 50,
+            # STRICT BUDGET: 20 NODES
+            'max_total_nodes': 20,
             
             # Dynamic Ratio: We no longer hard-cap events/objects.
             # They compete based on score.
-            'max_event_nodes': 50, 
-            'max_object_nodes': 50,
+            'max_event_nodes': 20, 
+            'max_object_nodes': 20,
             
             # EDGE SAFETY: High limit to prevent "Prune Nodes -> Keep Edges -> Trigger Again" loop
-            'max_edges': 1500,  
+            'max_edges': 400,  
             
             # Saturation
             'score_saturation_threshold': 0.95,
-            'saturation_count_trigger': 20, # Scaled down for 50 nodes
+            'saturation_count_trigger': 10, # Scaled down for 20 nodes
             
             # Steiner tree settings
             'use_articulation_points': True,
             'use_shortest_paths': True,
-            'shortest_path_node_limit': 100,
+            'shortest_path_node_limit': 50,
             'max_path_length': 3,
         }
 
@@ -223,111 +223,191 @@ class GraphEngine:
             List of iteration evaluation results
         """
         return self.iteration_metrics
+    
+    def _log_final_best_subgraph_evaluation(self, time_reference: str):
+        """
+        Evaluate ONLY the final best subgraph for official retrieval accuracy.
+        This is called AFTER all iterations complete.
+        
+        This provides the single "retrieval accuracy" metric that should be used
+        for performance evaluation, while iteration_metrics contains all subgraphs
+        for debugging purposes.
+        
+        Args:
+            time_reference: Time reference string from QA data
+        """
+        if not time_reference or time_reference.strip() in ["N/A", "", "None", "None-None"]:
+            return
+        
+        if not self.subgraphs:
+            print(f"  📊 Final Evaluation: No subgraphs to evaluate")
+            return
+        
+        # Select the final best subgraph using the same logic as select_best_subgraphs
+        best_subgraph = None
+        best_score = -1
+        
+        for sg in self.subgraphs:
+            if len(sg.nodes) < 2:  # Skip broken graphs
+                continue
+            score = self._calculate_answerability_score(sg)
+            if score > best_score:
+                best_score = score
+                best_subgraph = sg
+        
+        if best_subgraph is None:
+            print(f"  📊 Final Evaluation: No valid subgraphs found")
+            return
+        
+        # Evaluate the best subgraph
+        best_result = self._evaluate_single_subgraph(best_subgraph, time_reference.strip())
+        
+        # Add to iteration_metrics as a special final entry
+        final_data = {
+            'iteration': 'final_best_subgraph',
+            'note': 'This is the official retrieval accuracy metric (best subgraph only)',
+            'total_subgraphs_in_pool': len(self.subgraphs),
+            'best_subgraph': best_result,
+            'answerability_score': best_score
+        }
+        self.iteration_metrics.append(final_data)
+        
+        # Print summary
+        if best_result and best_result['overlap'] is not None:
+            overlap = best_result['overlap']
+            print(f"\n  🎯 FINAL BEST SUBGRAPH EVALUATION")
+            print(f"     Subgraph ID: {best_result['subgraph_id']}")
+            print(f"     ⭐ Retrieval Accuracy (Overlap): {overlap:.3f}")
+            print(f"     Answerability Score: {best_score:.4f}")
+            print(f"     Composition: {best_result['num_events']}E/{best_result['num_objects']}O/{best_result['num_nodes']}N, {best_result['num_edges']}Edges")
+            print(f"     (Selected from pool of {len(self.subgraphs)} subgraphs)")
+        else:
+            print(f"  🎯 FINAL: Best subgraph evaluation complete - no valid overlap")
 
     
-    def _evaluate_subgraphs(self, time_reference: str) -> List[Dict]:
+    def _evaluate_single_subgraph(self, subgraph: Subgraph, time_reference: str) -> Dict:
         """
-        Evaluate overlap for each subgraph separately.
+        Evaluate overlap for a SINGLE subgraph.
         
         DEBUG + SELF-HEALING MODE: 
         1. Scans for bad nodes (missing time/empty objects).
         2. BREAKPOINT triggers on detection to allow inspection.
         3. Prunes bad nodes to prevent crash and continues execution.
+        
+        Args:
+            subgraph: The subgraph to evaluate
+            time_reference: Time reference string from QA data
+        
+        Returns:
+            Dictionary with evaluation results for this subgraph
+        """
+        # --- 1. CLEANUP PASS: Identify and remove bad nodes ---
+        nodes_to_remove = []
+        
+        # Iterate safely over copy of items to allow modification later
+        for node_id, node in list(subgraph.nodes.items()):
+            # A. Validate EVENTS
+            if node.type == 'event':
+                has_valid_time = False
+                
+                # Check 'duration' [start, end]
+                if 'duration' in node.metadata and isinstance(node.metadata['duration'], (list, tuple)) and len(node.metadata['duration']) >= 2:
+                    float(node.metadata['duration'][0])
+                    float(node.metadata['duration'][1])
+                    has_valid_time = True
+                if not has_valid_time and 'start_time' in node.metadata:
+                    float(node.metadata['start_time'])
+                    has_valid_time = True
+                if not has_valid_time and 'timestamps' in node.metadata and isinstance(node.metadata['timestamps'], (list, tuple)) and len(node.metadata['timestamps']) >= 2:
+                    float(node.metadata['timestamps'][0])
+                    has_valid_time = True
+                if not has_valid_time:
+                    print("\n" + "!"*60)
+                    print(f"🚨 FOUND CORRUPT EVENT NODE: {node_id}")
+                    print(f"   Node Type: {node.type}")
+                    print(f"   Metadata keys: {list(node.metadata.keys())}")
+                    print(f"   Full Metadata: {node.metadata}")
+                    print("!"*60)
+                    print("🛑 Pausing for inspection. Type 'c' to PRUNE this node and continue.")
+                    # breakpoint() # <--- EXECUTION STOPS HERE
+                    
+                    # Mark for removal
+                    nodes_to_remove.append(node_id)
+
+            # B. Validate OBJECTS
+            elif node.type == 'object':
+                # If object has absolutely no metadata or content
+                if not node.content and not node.metadata:
+                    print("\n" + "!"*60)
+                    print(f"🚨 FOUND EMPTY OBJECT NODE: {node_id}")
+                    print("!"*60)
+                    print("🛑 Pausing for inspection. Type 'c' to PRUNE this node and continue.")
+                    # breakpoint() # <--- EXECUTION STOPS HERE
+                    
+                    nodes_to_remove.append(node_id)
+        
+        # Execute removal (Safe Pruning)
+        if nodes_to_remove:
+            print(f"✂️  Pruning {len(nodes_to_remove)} bad nodes from subgraph {subgraph.id}...")
+            for node_id in nodes_to_remove:
+                subgraph.remove_node(node_id)
+
+        # --- 2. EVALUATION PASS (Safe on cleaned graph) ---
+        time_list = []
+        for node in subgraph.nodes.values():
+            # We can now safely access metadata because bad nodes are gone
+            start_time_seconds = 0.0
+            end_time_seconds = 0.0
+            found_time = False
+            if node.type == 'event':
+                meta = node.metadata
+                if 'duration' in meta:
+                    start_time_seconds = float(meta['duration'][0])
+                    end_time_seconds = float(meta['duration'][1])
+                    found_time = True
+            elif node.type == 'object':
+                for duration in node.metadata["durations"]:
+                    start_time_seconds_i = float(duration[0])
+                    end_time_seconds_i = float(duration[1])
+                    if end_time_seconds_i > start_time_seconds_i:
+                        time_list.append((start_time_seconds_i, end_time_seconds_i))
+            
+            if found_time and end_time_seconds > start_time_seconds:
+                time_list.append((start_time_seconds, end_time_seconds))
+        
+        # Evaluate overlap
+        overlap = overlap_reference_helper(time_reference, time_list)
+        
+        # Collect statistics
+        objects = subgraph.get_nodes_by_type('object')
+        result = {
+            'subgraph_id': subgraph.id,
+            'overlap': overlap,
+            'num_nodes': len(subgraph.nodes),
+            'num_events': len(subgraph.get_nodes_by_type('event')),
+            'num_objects': len(objects),
+            'num_edges': len(subgraph.edges)
+        }
+        
+        return result
+    
+    def _evaluate_subgraphs(self, time_reference: str) -> List[Dict]:
+        """
+        Evaluate overlap for each subgraph separately.
+        
+        This method evaluates ALL subgraphs and is kept for backward compatibility
+        or special debugging purposes. For iteration evaluation, use 
+        _evaluate_single_subgraph() on the best subgraph instead.
         """
         results = []
         for subgraph in self.subgraphs:
-            # --- 1. CLEANUP PASS: Identify and remove bad nodes ---
-            nodes_to_remove = []
-            
-            # Iterate safely over copy of items to allow modification later
-            for node_id, node in list(subgraph.nodes.items()):
-                # A. Validate EVENTS
-                if node.type == 'event':
-                    has_valid_time = False
-                    
-                    # Check 'duration' [start, end]
-                    if 'duration' in node.metadata and isinstance(node.metadata['duration'], (list, tuple)) and len(node.metadata['duration']) >= 2:
-                        float(node.metadata['duration'][0])
-                        float(node.metadata['duration'][1])
-                        has_valid_time = True
-                    if not has_valid_time and 'start_time' in node.metadata:
-                        float(node.metadata['start_time'])
-                        has_valid_time = True
-                    if not has_valid_time and 'timestamps' in node.metadata and isinstance(node.metadata['timestamps'], (list, tuple)) and len(node.metadata['timestamps']) >= 2:
-                        float(node.metadata['timestamps'][0])
-                        has_valid_time = True
-                    if not has_valid_time:
-                        print("\n" + "!"*60)
-                        print(f"🚨 FOUND CORRUPT EVENT NODE: {node_id}")
-                        print(f"   Node Type: {node.type}")
-                        print(f"   Metadata keys: {list(node.metadata.keys())}")
-                        print(f"   Full Metadata: {node.metadata}")
-                        print("!"*60)
-                        print("🛑 Pausing for inspection. Type 'c' to PRUNE this node and continue.")
-                        # breakpoint() # <--- EXECUTION STOPS HERE
-                        
-                        # Mark for removal
-                        nodes_to_remove.append(node_id)
-
-                # B. Validate OBJECTS
-                elif node.type == 'object':
-                    # If object has absolutely no metadata or content
-                    if not node.content and not node.metadata:
-                        print("\n" + "!"*60)
-                        print(f"🚨 FOUND EMPTY OBJECT NODE: {node_id}")
-                        print("!"*60)
-                        print("🛑 Pausing for inspection. Type 'c' to PRUNE this node and continue.")
-                        # breakpoint() # <--- EXECUTION STOPS HERE
-                        
-                        nodes_to_remove.append(node_id)
-            
-            # Execute removal (Safe Pruning)
-            if nodes_to_remove:
-                print(f"✂️  Pruning {len(nodes_to_remove)} bad nodes from subgraph {subgraph.id}...")
-                for node_id in nodes_to_remove:
-                    subgraph.remove_node(node_id)
-
-            # --- 2. EVALUATION PASS (Safe on cleaned graph) ---
-            time_list = []
-            for node in subgraph.nodes.values():
-                # We can now safely access metadata because bad nodes are gone
-                start_time_seconds = 0.0
-                end_time_seconds = 0.0
-                found_time = False
-                if node.type == 'event':
-                    meta = node.metadata
-                    if 'duration' in meta:
-                        start_time_seconds = float(meta['duration'][0])
-                        end_time_seconds = float(meta['duration'][1])
-                        found_time = True
-                elif node.type == 'object':
-                    for duration in node.metadata["durations"]:
-                        start_time_seconds_i = float(duration[0])
-                        end_time_seconds_i = float(duration[1])
-                        if end_time_seconds_i > start_time_seconds_i:
-                            time_list.append((start_time_seconds_i, end_time_seconds_i))
-                
-                if found_time and end_time_seconds > start_time_seconds:
-                    time_list.append((start_time_seconds, end_time_seconds))
-            
-            # Evaluate overlap
-            overlap = overlap_reference_helper(time_reference, time_list)
-            
-            # Collect statistics
-            objects = subgraph.get_nodes_by_type('object')
-            results.append({
-                'subgraph_id': subgraph.id,
-                'overlap': overlap,
-                'num_nodes': len(subgraph.nodes),
-                'num_events': len(subgraph.get_nodes_by_type('event')),
-                'num_objects': len(objects),
-                'num_edges': len(subgraph.edges)
-            })
+            result = self._evaluate_single_subgraph(subgraph, time_reference)
+            results.append(result)
         return results
     
     def _log_iteration_evaluation(self, iteration_label: str, time_reference: str):
         """
-        Evaluate all subgraphs and store results in iteration_metrics.
+        Evaluate ALL subgraphs and store results in iteration_metrics (for debugging).
         
         Args:
             iteration_label: Label for this evaluation (e.g., "iteration_0_seeds", "iteration_1")
@@ -337,7 +417,7 @@ class GraphEngine:
             # No time reference available, skip evaluation
             return
         
-        # Evaluate all subgraphs
+        # Evaluate all subgraphs (for debugging)
         subgraph_results = self._evaluate_subgraphs(time_reference.strip())
         
         # Store in iteration_metrics
@@ -427,6 +507,11 @@ class GraphEngine:
         # 3. Post-Processing
         print(f"\n--- Post-Processing ---")
         self._finalize_all_subgraphs()
+
+        # 4. Final Best Subgraph Evaluation (Official Retrieval Accuracy)
+        if time_reference:
+            print(f"\n--- Final Best Subgraph Evaluation ---")
+            self._log_final_best_subgraph_evaluation(time_reference)
 
         print("\n📊 Operation Statistics (Diagnosis):")
         for op, stats in self._op_stats.items():
