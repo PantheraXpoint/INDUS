@@ -84,6 +84,8 @@ class GraphEngine:
                  top_k_objects: int = 5,
                  adaptive_threshold: bool = False,
                  threshold_percentile: int = 80,
+                 prize_based_seeds: bool = False,
+                 top_k_protected: int = 5):  
         self.kg = knowledge_graph
         self.context_graph = context_graph
         self.scorer = scorer
@@ -100,6 +102,10 @@ class GraphEngine:
         # M3: Store adaptive threshold settings
         self.adaptive_threshold = adaptive_threshold
         self.threshold_percentile = threshold_percentile
+
+        # M7: Store prize-based seeds settings
+        self.prize_based_seeds = prize_based_seeds
+        self.top_k_protected = top_k_protected
         
         # === PER-QUERY STATE (reset each search) ===
         self._reset_query_state()
@@ -585,6 +591,7 @@ class GraphEngine:
         if not valid_subgraphs:
             print("❌ FINAL ERROR: No non-empty subgraphs remain for aggregation!")
             return "No information found.", []
+
 
         answer, final_subgraphs = self._aggregation(query)
         
@@ -1361,31 +1368,76 @@ class GraphEngine:
         max_total = config['max_total_nodes']
         terminals = set()
         
-        # 1. Identify seeds (Always keep)
-        seeds = [n for n in subgraph.nodes.values() if n.metadata.get('is_seed', False)]
-        for seed in seeds:
-            terminals.add(seed.id)
+        # ====================================================================
+        # 1. Identify seeds with M7 Prize-Based Protection
+        # ====================================================================
+        all_seeds = [n for n in subgraph.nodes.values() if n.metadata.get('is_seed', False)]
+        
+        if self.prize_based_seeds and len(all_seeds) > 0:
+            # M7: Sort seeds by score descending
+            all_seeds.sort(key=lambda n: n.score, reverse=True)
             
+            # Protect only top-k seeds
+            num_protected = min(self.top_k_protected, len(all_seeds))
+            protected_seeds = all_seeds[:num_protected]
+            
+            # Assign descending prizes to protected seeds
+            for i, seed in enumerate(protected_seeds):
+                prize = num_protected - i  # k, k-1, k-2, ..., 1
+                
+                # Boost score with prize (multiplicative)
+                boost_factor = 1.0 + (prize / (num_protected * 2))
+                seed.score *= boost_factor
+                
+                # Add to terminals
+                terminals.add(seed.id)
+            
+            # Debug output
+            print(f"  [M7] Prize-based seeds: protected {num_protected}/{len(all_seeds)} "
+                f"seeds (prizes: {num_protected} to 1)")
+            
+            # Unprotected seeds are NOT added to terminals (can compete with other nodes)
+            if len(all_seeds) > num_protected:
+                unprotected_count = len(all_seeds) - num_protected
+                print(f"  [M7] {unprotected_count} low-scoring seeds competing with non-seeds")
+        else:
+            # Original behavior: protect ALL seeds
+            for seed in all_seeds:
+                terminals.add(seed.id)
+            
+            if all_seeds and not self.prize_based_seeds:
+                print(f"  [M7] Protected all {len(all_seeds)} seeds (M7 disabled)")
+        
+        # ====================================================================
         # 2. Reserve buffer for Steiner Bridges (20% or min 5)
-        # This ensures we have space to connect the high-scoring nodes later
+        # ====================================================================
         bridge_buffer = max(5, int(max_total * 0.2))
         available_slots = max_total - len(terminals) - bridge_buffer
         
         if available_slots <= 0:
             return terminals
-            
-        # 3. Dynamic Selection: Sort ALL non-seed nodes by score
-        # Events and Objects compete fairly based on relevance
-        candidates = [
-            n for n in subgraph.nodes.values() 
-            if not n.metadata.get('is_seed', False)
-        ]
+        
+        # ====================================================================
+        # 3. Dynamic Selection: Sort ALL non-terminal nodes by score
+        # ====================================================================
+        # This includes:
+        # - Non-seed nodes (events and objects)
+        # - Unprotected seeds (if M7 enabled)
+        candidates = []
+        for node in subgraph.nodes.values():
+            # Skip nodes already in terminals (protected seeds)
+            if node.id in terminals:
+                continue
+            # Include all other nodes (non-seeds + unprotected seeds)
+            candidates.append(node)
+        
+        # Sort by score descending (boosted protected seeds already in terminals)
         candidates.sort(key=lambda n: n.score, reverse=True)
         
-        # Take top N candidates
+        # Take top N candidates to fill available slots
         for node in candidates[:available_slots]:
             terminals.add(node.id)
-            
+        
         return terminals
     
     def _find_steiner_nodes(self, subgraph: Subgraph, terminals: Set[str], max_count: int) -> Set[str]:
