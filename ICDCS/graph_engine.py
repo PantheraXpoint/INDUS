@@ -579,10 +579,77 @@ class GraphEngine:
         self._finalize_all_subgraphs()
 
         # 4. Final Best Subgraph Evaluation (Official Retrieval Accuracy)
+        # ================================================================
+        # TWO-STAGE EVALUATION
+        # ================================================================
         if time_reference:
-            print(f"\n--- Final Best Subgraph Evaluation ---")
+            print(f"\n{'='*80}")
+            print("TWO-STAGE EVALUATION")
+            print(f"{'='*80}")
+            
+            # ============================================================
+            # STAGE 1: Evaluate current state (full exploration graph)
+            # ============================================================
+            print(f"\n📊 STAGE 1: After Exploration")
             self._log_final_best_subgraph_evaluation(time_reference)
+            
+            # Store the full graph evaluation for comparison
+            full_graph_metrics = self.iteration_metrics[-1]  # Just added by above call
+            
+            # ============================================================
+            # STAGE 2: Prune to LLM budget and evaluate again
+            # ============================================================
+            llm_budget = 20  # Target nodes for LLM
+            
+            # Find and prune the best subgraph
+            best_subgraph = None
+            best_score = -1
+            for sg in self.subgraphs:
+                if len(sg.nodes) < 2:
+                    continue
+                score = self._calculate_answerability_score(sg)
+                if score > best_score:
+                    best_score = score
+                    best_subgraph = sg
+            
+            if best_subgraph and len(best_subgraph.nodes) > llm_budget:
+                print(f"\n📊 STAGE 2: Pruning for LLM")
+                print(f"  Original: {len(best_subgraph.nodes)} nodes")
+                
+                # Temporarily change pruning config
+                old_max = self.pruning_config['max_total_nodes']
+                self.pruning_config['max_total_nodes'] = llm_budget
+                
+                # Prune the best subgraph in place
+                stats = self._prune_subgraph_steiner(best_subgraph)
+                
+                # Restore config
+                self.pruning_config['max_total_nodes'] = old_max
+                
+                print(f"  Pruned to: {stats['final_nodes']} nodes ({stats['final_events']}E/{stats['final_objects']}O)")
+                
+                # Now evaluate the pruned state
+                print(f"\n📊 STAGE 2: After Pruning for LLM")
+                self._log_final_best_subgraph_evaluation(time_reference)
+                
+                # Calculate and display selection loss
+                llm_graph_metrics = self.iteration_metrics[-1]  # Just added
+                if (full_graph_metrics['best_subgraph']['overlap'] is not None and 
+                    llm_graph_metrics['best_subgraph']['overlap'] is not None):
+                    selection_loss = (full_graph_metrics['best_subgraph']['overlap'] - 
+                                    llm_graph_metrics['best_subgraph']['overlap'])
+                    print(f"\n  📉 Selection Loss: {selection_loss:.3f}")
+                    
+                    # Add selection loss to metrics
+                    llm_graph_metrics['selection_loss'] = selection_loss
+            else:
+                if best_subgraph:
+                    print(f"\n📊 STAGE 2: Graph already within budget ({len(best_subgraph.nodes)} ≤ {llm_budget})")
+                    print(f"  No pruning needed - Stage 1 and Stage 2 are identical")
+            
+            print(f"{'='*80}\n")
 
+        # Rest of existing code unchanged
         print("\n📊 Operation Statistics (Diagnosis):")
         for op, stats in self._op_stats.items():
             print(f"  - {op}: Attempted {stats['attempted']} -> Added {stats['added']}")
