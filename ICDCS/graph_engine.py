@@ -78,13 +78,17 @@ class GraphEngine:
                  knowledge_graph: KnowledgeGraphInterface, 
                  context_graph: Optional[ContextGraphInterface] = None, 
                  scorer: Optional[GraphScorer] = None,
+                 llm = None,
                  constrained_propagation: bool = False,
                  top_k_events: int = 5,
                  top_k_objects: int = 5,
+                 adaptive_threshold: bool = False,
+                 threshold_percentile: int = 80,
         self.kg = knowledge_graph
         self.context_graph = context_graph
         self.scorer = scorer
         self.llm = llm
+
         # M4: Initialize query embedding storage
         self.query_embedding = None
 
@@ -92,6 +96,10 @@ class GraphEngine:
         self.constrained_propagation = constrained_propagation
         self.top_k_events = top_k_events
         self.top_k_objects = top_k_objects
+
+        # M3: Store adaptive threshold settings
+        self.adaptive_threshold = adaptive_threshold
+        self.threshold_percentile = threshold_percentile
         
         # === PER-QUERY STATE (reset each search) ===
         self._reset_query_state()
@@ -506,6 +514,27 @@ class GraphEngine:
                     active_objects = subgraph.get_nodes_by_type('object')
 
 
+                # ====================================================================
+                # M3: ADAPTIVE THRESHOLD
+                # ====================================================================
+                score_threshold = self._calculate_adaptive_threshold(subgraph)
+                
+                if self.adaptive_threshold:
+                    print(f"  [M3] Adaptive threshold: {score_threshold:.4f} "
+                        f"({self.threshold_percentile}th percentile)")
+                
+                # Filter nodes by adaptive threshold
+                active_events = [e for e in active_events if e.score >= score_threshold]
+                active_objects = [o for o in active_objects if o.score >= score_threshold]
+                
+                if self.adaptive_threshold:
+                    print(f"  [M3] After threshold filter: "
+                        f"{len(active_events)} events, {len(active_objects)} objects")
+
+
+                # ====================================================================
+                # EXPANSION OPERATIONS (unchanged)
+                # ====================================================================
                 
                 # 1. Expand Events (Structure + Vector)
                 for event in active_events:
@@ -584,6 +613,46 @@ class GraphEngine:
                     elif edge.target_id == source_id and edge.type == edge_type:
                          neighbors.add(edge.source_id)
         return neighbors
+
+    def _calculate_adaptive_threshold(self, subgraph: Subgraph) -> float:
+        """
+        M3: Calculate adaptive threshold based on score distribution.
+        
+        Instead of fixed threshold (0.001), use percentile-based threshold
+        that adapts to the current score distribution.
+        
+        Args:
+            subgraph: Current subgraph to analyze
+            
+        Returns:
+            float: Threshold value to use for filtering nodes
+        """
+        if not self.adaptive_threshold:
+            return 0.001  # Default fixed threshold if M3 disabled
+        
+        # Get all node scores
+        scores = [node.score for node in subgraph.nodes.values()]
+        
+        if len(scores) == 0:
+            return 0.001  # Fallback if no nodes
+        
+        # Sort scores to calculate percentile
+        scores.sort()
+        
+        # Calculate percentile index
+        # Example: 80th percentile of [0.1, 0.2, 0.3, 0.4, 0.5] is 0.4
+        percentile_idx = int(len(scores) * (self.threshold_percentile / 100.0))
+        percentile_idx = min(percentile_idx, len(scores) - 1)  # Stay within bounds
+        
+        threshold = scores[percentile_idx]
+        
+        # Safety bounds: never go below 0.01 or above 0.5
+        # This prevents:
+        # - Too aggressive filtering (< 0.01 would keep almost nothing)
+        # - Too permissive filtering (> 0.5 would keep everything)
+        threshold = max(0.01, min(0.5, threshold))
+        
+        return threshold
 
     # ------------------------------------------------------------------
     # Operations
