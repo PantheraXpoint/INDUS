@@ -20,8 +20,8 @@ Usage:
     python calculate_accuracy.py --results-dir ava100_results --output accuracy_report.json
     python calculate_accuracy.py --results-dir ava100_results --llm-budget 20
     
-    # Force recalculate overlaps (fixes old reports with accuracy > 1.0)
-    python calculate_accuracy.py --results-dir ava100_results --force-recalculate --output fixed_report.json
+    # Force recalculate overlaps AND regenerate stages with different budget
+    python calculate_accuracy.py --results-dir ava100_results --force-recalculate --llm-budget 30 --output report_budget30.json
     
     # Compare your method vs baseline
     python calculate_accuracy.py --results-dir ava100_results --evaluate-baseline --cache-dir AVA_cache
@@ -350,8 +350,8 @@ def generate_stages_from_subgraph(subgraph_path: Path,
     if save_to_disk:
         output_dir = subgraph_path.parent
         
-        # Save Stage 2 (Steiner)
-        stage2_path = output_dir / "best_subgraph_stage2.json"
+        # Save Stage 2 (Steiner) - include budget in filename
+        stage2_path = output_dir / f"best_subgraph_stage2_budget{llm_budget}.json"
         stage2_data = export_subgraph_to_json(stage2_subgraph, str(stage2_path), pruning_config)
         # Add metadata
         with open(stage2_path, 'r') as f:
@@ -365,8 +365,8 @@ def generate_stages_from_subgraph(subgraph_path: Path,
         with open(stage2_path, 'w') as f:
             json.dump(stage2_data, f, indent=2)
         
-        # Save Stage 3 (Top-k)
-        stage3_path = output_dir / "best_subgraph_stage3.json"
+        # Save Stage 3 (Top-k) - include budget in filename
+        stage3_path = output_dir / f"best_subgraph_stage3_budget{llm_budget}.json"
         stage3_data = export_subgraph_to_json(stage3_subgraph, str(stage3_path), pruning_config)
         # Add metadata
         with open(stage3_path, 'r') as f:
@@ -380,8 +380,8 @@ def generate_stages_from_subgraph(subgraph_path: Path,
         with open(stage3_path, 'w') as f:
             json.dump(stage3_data, f, indent=2)
         
-        # Save Stage 4 (Event-centric)
-        stage4_path = output_dir / "best_subgraph_stage4.json"
+        # Save Stage 4 (Event-centric) - include budget in filename
+        stage4_path = output_dir / f"best_subgraph_stage4_budget{llm_budget}.json"
         stage4_data = export_subgraph_to_json(stage4_subgraph, str(stage4_path), pruning_config)
         # Add metadata
         with open(stage4_path, 'r') as f:
@@ -396,28 +396,30 @@ def generate_stages_from_subgraph(subgraph_path: Path,
             json.dump(stage4_data, f, indent=2)
         
         print(f"     💾 Saved pruned subgraphs to {output_dir}/")
-        print(f"        - best_subgraph_stage2.json ({stage2_result['num_nodes']} nodes)")
-        print(f"        - best_subgraph_stage3.json ({stage3_result['num_nodes']} nodes)")
-        print(f"        - best_subgraph_stage4.json ({stage4_result['num_nodes']} nodes)")
+        print(f"        - best_subgraph_stage2_budget{llm_budget}.json ({stage2_result['num_nodes']} nodes)")
+        print(f"        - best_subgraph_stage3_budget{llm_budget}.json ({stage3_result['num_nodes']} nodes)")
+        print(f"        - best_subgraph_stage4_budget{llm_budget}.json ({stage4_result['num_nodes']} nodes)")
     
     # Calculate selection loss and comparisons
     selection_loss = None
     if stage1_result['overlap'] is not None and stage2_result['overlap'] is not None:
         selection_loss = stage1_result['overlap'] - stage2_result['overlap']
     
-    # Determine best method
-    best_overlap = max(
-        stage2_result['overlap'] or 0,
-        stage3_result['overlap'] or 0,
-        stage4_result['overlap'] or 0
-    )
+    # Determine best method (only if we have valid overlaps)
+    best_overlap = None
     best_methods = []
-    if stage2_result['overlap'] == best_overlap:
-        best_methods.append("Steiner")
-    if stage3_result['overlap'] == best_overlap:
-        best_methods.append("Top-k")
-    if stage4_result['overlap'] == best_overlap:
-        best_methods.append("Event-Centric")
+    if stage2_result['overlap'] is not None:
+        best_overlap = max(
+            stage2_result['overlap'] or 0,
+            stage3_result['overlap'] or 0,
+            stage4_result['overlap'] or 0
+        )
+        if stage2_result['overlap'] == best_overlap:
+            best_methods.append("Steiner")
+        if stage3_result['overlap'] == best_overlap:
+            best_methods.append("Top-k")
+        if stage4_result['overlap'] == best_overlap:
+            best_methods.append("Event-Centric")
     
     return {
         'stage1': stage1_result,
@@ -475,17 +477,96 @@ def extract_accuracy_from_log(log_path: Path, llm_budget: int = 20, enable_on_de
         iterations = data.get('iterations', [])
         
         if not iterations:
+            # Even if no iterations, try to load best_subgraph.json if it exists
+            # This handles cases where iteration log is incomplete but subgraph was saved
+            if enable_on_demand or save_pruned_subgraphs:
+                subgraph_dir = log_path.parent
+                best_subgraph_path = subgraph_dir / "best_subgraph.json"
+                
+                if best_subgraph_path.exists():
+                    print(f"  ⚠️  Empty iterations list, but found best_subgraph.json for {video_key} Q{question_id}")
+                    
+                    if save_pruned_subgraphs:
+                        print(f"  🔄 Generating pruned stages from best_subgraph.json...")
+                        try:
+                            # Generate stages even without iteration log data
+                            stage_results = generate_stages_from_subgraph(
+                                best_subgraph_path, 
+                                time_reference,
+                                llm_budget=llm_budget,
+                                save_to_disk=True  # Force save since user requested it
+                            )
+                            
+                            if stage_results:
+                                # Return results even though we don't have full iteration data
+                                return {
+                                    'video_key': video_key,
+                                    'question_id': question_id,
+                                    'query': query,
+                                    'time_reference': time_reference,
+                                    'status': 'generated_from_subgraph_only',
+                                    'format': 'on_demand_from_file',
+                                    'stage1_accuracy': stage_results['stage1']['overlap'],
+                                    'stage2_accuracy': stage_results['stage2']['overlap'],
+                                    'stage3_accuracy': stage_results['stage3']['overlap'],
+                                    'stage4_accuracy': stage_results['stage4']['overlap'],
+                                    'selection_loss': stage_results.get('selection_loss'),
+                                    'pruning_method_comparison': None,
+                                    'all_methods_comparison': {
+                                        'steiner_overlap': stage_results['stage2']['overlap'],
+                                        'topk_overlap': stage_results['stage3']['overlap'],
+                                        'eventcentric_overlap': stage_results['stage4']['overlap'],
+                                        'best_method': stage_results.get('best_methods', []),
+                                        'best_overlap': stage_results.get('best_overlap')
+                                    } if stage_results['stage2']['overlap'] is not None else None,
+                                    'stage1_nodes': stage_results['stage1']['num_nodes'],
+                                    'stage1_events': stage_results['stage1']['num_events'],
+                                    'stage1_objects': stage_results['stage1']['num_objects'],
+                                    'stage2_nodes': stage_results['stage2']['num_nodes'],
+                                    'stage2_events': stage_results['stage2']['num_events'],
+                                    'stage2_objects': stage_results['stage2']['num_objects'],
+                                    'stage3_nodes': stage_results['stage3']['num_nodes'],
+                                    'stage3_events': stage_results['stage3']['num_events'],
+                                    'stage3_objects': stage_results['stage3']['num_objects'],
+                                    'stage4_nodes': stage_results['stage4']['num_nodes'],
+                                    'stage4_events': stage_results['stage4']['num_events'],
+                                    'stage4_objects': stage_results['stage4']['num_objects'],
+                                    'baseline_per_path_overlaps': [],
+                                    'baseline_num_paths': 0,
+                                    'baseline_error': None,
+                                }
+                        except Exception as e:
+                            print(f"     ⚠️  Failed to generate stages: {e}")
+            
             return {
                 'video_key': video_key,
                 'question_id': question_id,
                 'query': query,
                 'time_reference': time_reference,
                 'status': 'no_iterations',
+                'format': 'unknown',
                 'stage1_accuracy': None,
                 'stage2_accuracy': None,
                 'stage3_accuracy': None,
                 'stage4_accuracy': None,
-                'selection_loss': None
+                'selection_loss': None,
+                'pruning_method_comparison': None,
+                'all_methods_comparison': None,
+                'stage1_nodes': 0,
+                'stage1_events': 0,
+                'stage1_objects': 0,
+                'stage2_nodes': 0,
+                'stage2_events': 0,
+                'stage2_objects': 0,
+                'stage3_nodes': 0,
+                'stage3_events': 0,
+                'stage3_objects': 0,
+                'stage4_nodes': 0,
+                'stage4_events': 0,
+                'stage4_objects': 0,
+                'baseline_per_path_overlaps': [],
+                'baseline_num_paths': 0,
+                'baseline_error': None,
             }
         
         # Find final evaluations (there may be 1, 2, 3, or 4 depending on evaluation mode)
@@ -531,16 +612,96 @@ def extract_accuracy_from_log(log_path: Path, llm_budget: int = 20, enable_on_de
                     }]
         
         if not final_entries:
+            # Even if no final entries, try to load best_subgraph.json if it exists
+            # This handles cases where iteration log is incomplete but subgraph was saved
+            if enable_on_demand or save_pruned_subgraphs:
+                subgraph_dir = log_path.parent
+                best_subgraph_path = subgraph_dir / "best_subgraph.json"
+                
+                if best_subgraph_path.exists():
+                    print(f"  ⚠️  No iterations in log, but found best_subgraph.json for {video_key} Q{question_id}")
+                    
+                    if save_pruned_subgraphs:
+                        print(f"  🔄 Generating pruned stages from best_subgraph.json...")
+                        try:
+                            # Generate stages even without iteration log data
+                            stage_results = generate_stages_from_subgraph(
+                                best_subgraph_path, 
+                                time_reference,
+                                llm_budget=llm_budget,
+                                save_to_disk=True  # Force save since user requested it
+                            )
+                            
+                            if stage_results:
+                                # Return results even though we don't have full iteration data
+                                return {
+                                    'video_key': video_key,
+                                    'question_id': question_id,
+                                    'query': query,
+                                    'time_reference': time_reference,
+                                    'status': 'generated_from_subgraph_only',
+                                    'format': 'on_demand_from_file',
+                                    'stage1_accuracy': stage_results['stage1']['overlap'],
+                                    'stage2_accuracy': stage_results['stage2']['overlap'],
+                                    'stage3_accuracy': stage_results['stage3']['overlap'],
+                                    'stage4_accuracy': stage_results['stage4']['overlap'],
+                                    'selection_loss': stage_results.get('selection_loss'),
+                                    'pruning_method_comparison': None,
+                                    'all_methods_comparison': {
+                                        'steiner_overlap': stage_results['stage2']['overlap'],
+                                        'topk_overlap': stage_results['stage3']['overlap'],
+                                        'eventcentric_overlap': stage_results['stage4']['overlap'],
+                                        'best_method': stage_results.get('best_methods', []),
+                                        'best_overlap': stage_results.get('best_overlap')
+                                    } if stage_results['stage2']['overlap'] is not None else None,
+                                    'stage1_nodes': stage_results['stage1']['num_nodes'],
+                                    'stage1_events': stage_results['stage1']['num_events'],
+                                    'stage1_objects': stage_results['stage1']['num_objects'],
+                                    'stage2_nodes': stage_results['stage2']['num_nodes'],
+                                    'stage2_events': stage_results['stage2']['num_events'],
+                                    'stage2_objects': stage_results['stage2']['num_objects'],
+                                    'stage3_nodes': stage_results['stage3']['num_nodes'],
+                                    'stage3_events': stage_results['stage3']['num_events'],
+                                    'stage3_objects': stage_results['stage3']['num_objects'],
+                                    'stage4_nodes': stage_results['stage4']['num_nodes'],
+                                    'stage4_events': stage_results['stage4']['num_events'],
+                                    'stage4_objects': stage_results['stage4']['num_objects'],
+                                    'baseline_per_path_overlaps': [],
+                                    'baseline_num_paths': 0,
+                                    'baseline_error': None,
+                                }
+                        except Exception as e:
+                            print(f"     ⚠️  Failed to generate stages: {e}")
+            
             return {
                 'video_key': video_key,
                 'question_id': question_id,
                 'query': query,
                 'time_reference': time_reference,
                 'status': 'no_final_evaluation',
+                'format': 'unknown',
                 'stage1_accuracy': None,
                 'stage2_accuracy': None,
                 'stage3_accuracy': None,
-                'selection_loss': None
+                'stage4_accuracy': None,
+                'selection_loss': None,
+                'pruning_method_comparison': None,
+                'all_methods_comparison': None,
+                'stage1_nodes': 0,
+                'stage1_events': 0,
+                'stage1_objects': 0,
+                'stage2_nodes': 0,
+                'stage2_events': 0,
+                'stage2_objects': 0,
+                'stage3_nodes': 0,
+                'stage3_events': 0,
+                'stage3_objects': 0,
+                'stage4_nodes': 0,
+                'stage4_events': 0,
+                'stage4_objects': 0,
+                'baseline_per_path_overlaps': [],
+                'baseline_num_paths': 0,
+                'baseline_error': None,
             }
         
         # Extract accuracies from explicit stage entries (more robust)
@@ -661,6 +822,7 @@ def extract_accuracy_from_log(log_path: Path, llm_budget: int = 20, enable_on_de
         # If force_recalculate is True, reload subgraphs and recalculate overlaps
         # This is useful when the iteration_log.json contains overlaps calculated
         # with an old/buggy version of percentage_overlap function
+        # NOTE: We only recalculate overlaps if time_reference exists (otherwise overlap will be None)
         if force_recalculate and stage1_accuracy is not None and time_reference != 'N/A':
             subgraph_dir = log_path.parent
             best_subgraph_path = subgraph_dir / "best_subgraph.json"
@@ -705,21 +867,30 @@ def extract_accuracy_from_log(log_path: Path, llm_budget: int = 20, enable_on_de
         # ========================================================================
         # If we have Stage 1 but missing Stages 2/3/4, generate them dynamically
         # from the best_subgraph.json file
-        if enable_on_demand and stage1_accuracy is not None:
+        # NOTE: We now generate pruned subgraphs for ALL questions (even without time_reference)
+        # but only calculate accuracy if time_reference is available
+        if enable_on_demand:
             missing_stages = (stage2_accuracy is None or 
                             stage3_accuracy is None or 
                             stage4_accuracy is None)
             
-            if missing_stages:
+            # Force regeneration if force_recalculate is True (for different budget experiments)
+            should_generate = missing_stages or force_recalculate
+            
+            if should_generate:
                 # Try to load best_subgraph.json from same directory
                 subgraph_dir = log_path.parent
                 best_subgraph_path = subgraph_dir / "best_subgraph.json"
                 
                 if best_subgraph_path.exists():
-                    print(f"  🔄 Generating missing stages on-demand for {video_key} Q{question_id}...")
+                    if force_recalculate:
+                        print(f"  🔄 Forcing regeneration of stages (budget={llm_budget}) for {video_key} Q{question_id}...")
+                    else:
+                        print(f"  🔄 Generating missing stages on-demand for {video_key} Q{question_id}...")
                     
                     try:
                         # Generate all stages from Stage 1 subgraph
+                        # This will work even if time_reference is 'N/A' (overlaps will be None)
                         stage_results = generate_stages_from_subgraph(
                             best_subgraph_path, 
                             time_reference,
@@ -728,7 +899,7 @@ def extract_accuracy_from_log(log_path: Path, llm_budget: int = 20, enable_on_de
                         )
                         
                         if stage_results:
-                            # Update missing accuracies
+                            # Update missing accuracies (may be None if no time reference)
                             # Note: We always update from on-demand results since they are freshly generated
                             stage2_accuracy = stage_results['stage2']['overlap']
                             stage2_nodes = stage_results['stage2']['num_nodes']
@@ -749,18 +920,23 @@ def extract_accuracy_from_log(log_path: Path, llm_budget: int = 20, enable_on_de
                             if selection_loss is None:
                                 selection_loss = stage_results.get('selection_loss')
                             
-                            # Update comparison data
-                            if all_methods_comparison is None:
+                            # Update comparison data (only if we have valid overlaps)
+                            if all_methods_comparison is None and stage2_accuracy is not None:
                                 all_methods_comparison = {
                                     'steiner_overlap': stage2_accuracy,
                                     'topk_overlap': stage3_accuracy,
                                     'eventcentric_overlap': stage4_accuracy,
                                     'best_method': stage_results.get('best_methods', []),
-                                    'best_overlap': stage_results.get('best_overlap', 0)
+                                    'best_overlap': stage_results.get('best_overlap')
                                 }
                             
                             format_used = 'on_demand_generated'
-                            print(f"     ✅ Generated stages 2-4 (S2: {stage2_accuracy:.3f}, S3: {stage3_accuracy:.3f}, S4: {stage4_accuracy:.3f})")
+                            
+                            # Print appropriate message based on whether accuracy was calculated
+                            if stage2_accuracy is not None:
+                                print(f"     ✅ Generated stages 2-4 (S2: {stage2_accuracy:.3f}, S3: {stage3_accuracy:.3f}, S4: {stage4_accuracy:.3f})")
+                            else:
+                                print(f"     ✅ Generated stages 2-4 (nodes: S2={stage2_nodes}, S3={stage3_nodes}, S4={stage4_nodes}) - No time reference for accuracy")
                     
                     except Exception as e:
                         print(f"     ⚠️  Failed to generate stages: {e}")
@@ -1354,7 +1530,7 @@ def main():
     parser.add_argument('--baseline-only', action='store_true',
                         help='Evaluate baseline only (no benchmark results needed, reads from AVA_cache)')
     parser.add_argument('--force-recalculate', action='store_true',
-                        help='Recalculate overlaps from subgraphs instead of using pre-computed values from logs')
+                        help='Force recalculation: recalculate overlaps AND regenerate stages 2-4 even if they already exist (useful for testing different --llm-budget values)')
     
     args = parser.parse_args()
     

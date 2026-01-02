@@ -248,15 +248,10 @@ def prune_subgraph_event_centric(subgraph: Subgraph, max_nodes: int = 20) -> Dic
         
         if source_node and target_node:
             # Event -> Object edges
-            if source_node.type == 'event' and target_node.type == 'object':
+            if source_node.type == 'event' and target_node.type == 'event':
                 if edge.source_id not in event_to_objects:
                     event_to_objects[edge.source_id] = []
                 event_to_objects[edge.source_id].append(target_node)
-            # Object -> Event edges (reverse)
-            elif source_node.type == 'object' and target_node.type == 'event':
-                if edge.target_id not in event_to_objects:
-                    event_to_objects[edge.target_id] = []
-                event_to_objects[edge.target_id].append(source_node)
     
     # 3. Sort objects within each event by score (to pick best ones)
     for event_id, objects in event_to_objects.items():
@@ -265,7 +260,7 @@ def prune_subgraph_event_centric(subgraph: Subgraph, max_nodes: int = 20) -> Dic
     # 4. Select events and their objects
     # Like final_answer.py: limit to 5 objects per event
     keep_nodes = set()
-    max_objects_per_event = 5
+    max_objects_per_event = 20
     
     for event in all_events:
         # Check if we have budget for this event
