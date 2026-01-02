@@ -19,8 +19,8 @@ class GraphScorer:
             'init': 1.0,
             
             # Structure
-            'event_to_object': 0.9, 
-            'object_to_event': 0.9,
+            'event_object': 0.9, 
+            'object_event': 0.9,
             
             # Vector / Inference
             'vector_object': 0.9,   

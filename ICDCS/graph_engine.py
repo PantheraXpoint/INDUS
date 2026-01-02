@@ -874,14 +874,14 @@ class GraphEngine:
                 hub_size = len(kg_obj_ids)
                 # M4: Add embeddings
                 energy = self.scorer.calculate_energy_transfer(
-                    new_node.score, 'event_to_object', 
+                    new_node.score, 'event_object', 
                     current_iteration=self.current_iteration, 
                     hub_size=hub_size,
                     parent_embedding=new_node.embedding,      # NEW
                     query_embedding=self.query_embedding      # NEW
                 )
                 for tid in kg_obj_ids:
-                    triangulation_tasks.append((tid, energy, 'event_to_object', 'object'))
+                    triangulation_tasks.append((tid, energy, 'event_object', 'object'))
 
             # 2. Check Context Events (History)
             ctx_evt_ids = self._get_context_neighbors(new_node.id, 'event_to_event')
@@ -903,14 +903,14 @@ class GraphEngine:
                 global_count = self.kg.get_global_event_count_for_object(new_node.id)
                 # M4: Add embeddings
                 energy = self.scorer.calculate_energy_transfer(
-                    new_node.score, 'object_to_event', 
+                    new_node.score, 'object_event', 
                     current_iteration=self.current_iteration, 
                     global_uniqueness=global_count,
                     parent_embedding=new_node.embedding,      # NEW
                     query_embedding=self.query_embedding      # NEW
                 )
                 for tid in kg_evt_ids:
-                    triangulation_tasks.append((tid, energy, 'object_to_event', 'event'))
+                    triangulation_tasks.append((tid, energy, 'object_event', 'event'))
             
             # 2. Check Context Relations (Object -> Object)
             ctx_rel_ids = self._get_context_neighbors(new_node.id, 'relation')
@@ -1110,7 +1110,7 @@ class GraphEngine:
                     all_obj_ids = self.kg.get_objects_in_event(event.id)
                     # M4: Add embeddings
                     energy = self.scorer.calculate_energy_transfer(
-                        event.score, 'event_to_object', 
+                        event.score, 'event_object', 
                         current_iteration=self.current_iteration, 
                         hub_size=len(all_obj_ids),
                         parent_embedding=event.embedding,     # NEW
@@ -1126,7 +1126,7 @@ class GraphEngine:
                     global_count = self.kg.get_global_event_count_for_object(obj.id)
                     # M4: Add embeddings
                     energy = self.scorer.calculate_energy_transfer(
-                        obj.score, 'object_to_event', 
+                        obj.score, 'object_event', 
                         current_iteration=self.current_iteration, 
                         global_uniqueness=global_count,
                         parent_embedding=obj.embedding,       # NEW
