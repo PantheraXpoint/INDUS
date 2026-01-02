@@ -39,20 +39,38 @@ def percentage_overlap(time_list: List[Tuple[int, int]], time_ref: Tuple[int, in
 
     # General case: time_ref is an interval
     ref_length = ref_end - ref_start
-    total_covered = 0
-
+    
+    # Merge overlapping intervals within the reference range to avoid counting overlaps multiple times
+    relevant_intervals = []
     for start, end in time_list:
         if end <= start:
             continue  # skip invalid/empty chunks
-
-        # intersection with reference interval
+        # Clip to reference range
         s = max(start, ref_start)
         e = min(end, ref_end)
-
         if e > s:
-            total_covered += (e - s)
-
-    return total_covered / ref_length  # 0.0–1.0
+            relevant_intervals.append((s, e))
+    
+    if not relevant_intervals:
+        return 0.0
+    
+    # Sort intervals and merge overlapping ones
+    relevant_intervals.sort()
+    merged = [relevant_intervals[0]]
+    for current_start, current_end in relevant_intervals[1:]:
+        last_start, last_end = merged[-1]
+        if current_start <= last_end:
+            # Overlapping or adjacent, merge
+            merged[-1] = (last_start, max(last_end, current_end))
+        else:
+            # Non-overlapping, add as new interval
+            merged.append((current_start, current_end))
+    
+    # Calculate total covered length
+    total_covered = sum(end - start for start, end in merged)
+    
+    # Cap at 1.0 (100% coverage maximum)
+    return min(1.0, total_covered / ref_length) if ref_length > 0 else 0.0
 
 def overlap_reference_helper(time_ref: str, time_list: List[Tuple[int, int]]):
     time_ref = time_ref.strip()

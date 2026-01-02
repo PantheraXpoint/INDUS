@@ -291,18 +291,18 @@ class AVA100Benchmark:
             # self.current_ctx = None
             # self.active_connection_aliases.append(f'milvus_{video_key}_context')
             
-            self.current_scorer = GraphScorer(base_decay=0.8, alpha=0.7, beta=0.3)
+            self.current_scorer = GraphScorer(base_decay=0.8, alpha=0.7, beta=0.3) # M4
             self.current_graph_engine = GraphEngine(
                 self.current_kg, 
                 self.current_ctx, 
                 self.current_scorer, 
                 llm=self.llm,
-                constrained_propagation=True,
+                constrained_propagation=False, # M1
                 top_k_events=15,
                 top_k_objects=15,
-                adaptive_threshold=False,
+                adaptive_threshold=False, # M3
                 threshold_percentile=80,
-                prize_based_seeds=False,
+                prize_based_seeds=False, # M7
                 top_k_protected=5
             )
             self.current_video_key = video_key

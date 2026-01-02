@@ -3,10 +3,10 @@ import numpy as np
 import os
 from typing import List, Dict, Tuple, Optional
 # FAISSDB import removed - not used, code uses MilvusDB instead
-# Use relative imports since this file is part of the embeddings package
-from Milvus import MilvusDB
-from SQLiteDB import SQLiteDB
-from JinaCLIP import JinaCLIP
+# Use proper relative imports for embeddings package
+from .Milvus import MilvusDB
+from .SQLiteDB import SQLiteDB
+from .JinaCLIP import JinaCLIP
 
 class SearchSystem:
     """

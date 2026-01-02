@@ -13,65 +13,7 @@ from AVA.prompt import PROMPTS
 
 # Import evaluation functions from time_ref.py
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-try:
-    from time_ref import time_to_seconds, percentage_overlap, overlap_reference_helper
-except ImportError:
-    # Fallback: define locally if import fails
-    def time_to_seconds(time_str: str):
-        if len(time_str.split(":")) == 2:
-            minutes, seconds = time_str.split(":")
-            return int(minutes) * 60 + int(seconds)
-        elif len(time_str.split(":")) == 3:
-            hours, minutes, seconds = time_str.split(":")
-            return int(hours) * 3600 + int(minutes) * 60 + int(seconds)
-        else:
-            raise ValueError(f"Invalid time string: {time_str}")
-    
-    def percentage_overlap(time_list: List[Tuple[int, int]], time_ref: Tuple[int, int]) -> float:
-        ref_start, ref_end = time_ref
-        if ref_end < ref_start:
-            return 0.0
-        if ref_start == ref_end:
-            point = ref_start
-            for start, end in time_list:
-                if end <= start:
-                    continue
-                if start <= point < end:
-                    return 1.0
-            return 0.0
-        ref_length = ref_end - ref_start
-        total_covered = 0
-        for start, end in time_list:
-            if end <= start:
-                continue
-            s = max(start, ref_start)
-            e = min(end, ref_end)
-            if e > s:
-                total_covered += (e - s)
-        return total_covered / ref_length if ref_length > 0 else 0.0
-    
-    def overlap_reference_helper(time_ref: str, time_list: List[Tuple[int, int]]):
-        if time_ref == "N/A" or time_ref == "" or time_ref == "None" or time_ref == "None-None":
-            return None
-        if "-" in time_ref:
-            start_time, end_time = time_ref.split("-")
-            if start_time in ["", "None"]:
-                start_time = end_time
-            if end_time in ["", "None"]:
-                end_time = start_time
-            start_time_seconds = time_to_seconds(start_time)
-            end_time_seconds = time_to_seconds(end_time)
-        elif "," in time_ref:
-            points_overlap = []
-            points = time_ref.split(",")
-            for point in points:
-                point = point.strip()
-                points_overlap.append(percentage_overlap(time_list, (time_to_seconds(point), time_to_seconds(point))))
-            return sum(points_overlap) / len(points_overlap)
-        else:
-            start_time_seconds = time_to_seconds(time_ref)
-            end_time_seconds = start_time_seconds
-        return percentage_overlap(time_list, (start_time_seconds, end_time_seconds))
+from time_ref import time_to_seconds, percentage_overlap, overlap_reference_helper
 
 class GraphEngine:
     def __init__(self, 
