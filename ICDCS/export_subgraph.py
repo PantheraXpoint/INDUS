@@ -13,7 +13,7 @@ from ICDCS.graph_interfaces import Subgraph, Node, Edge
 from typing import List, Dict
 
 
-def export_subgraph_to_json(subgraph: Subgraph, output_path: str = None) -> Dict:
+def export_subgraph_to_json(subgraph: Subgraph, output_path: str = None, pruning_config: Dict = None) -> Dict:
     """
     Export a single subgraph to a detailed JSON structure.
     
@@ -21,6 +21,12 @@ def export_subgraph_to_json(subgraph: Subgraph, output_path: str = None) -> Dict
     - Nodes with full metadata
     - Edges with types and scores
     - Statistics and connectivity info
+    - Pruning configuration (for post-processing)
+    
+    Args:
+        subgraph: The subgraph to export
+        output_path: Optional path to save JSON file
+        pruning_config: Optional pruning configuration dict to save for later use
     """
     data = {
         'subgraph_id': subgraph.id,
@@ -33,11 +39,15 @@ def export_subgraph_to_json(subgraph: Subgraph, output_path: str = None) -> Dict
         },
         'nodes': [],
         'edges': [],
-        'edge_type_summary': {}
+        'edge_type_summary': {},
+        'pruning_config': pruning_config if pruning_config else {}
     }
     
-    # Export nodes with full details
-    for node in subgraph.nodes.values():
+    # Export nodes with full details (SORTED BY SCORE DESCENDING)
+    # This ensures consistency with top-k selection in final_answer.py
+    sorted_nodes = sorted(subgraph.nodes.values(), key=lambda n: n.score, reverse=True)
+    
+    for node in sorted_nodes:
         node_data = {
             'id': node.id,
             'type': node.type,
@@ -94,8 +104,13 @@ def export_subgraph_to_json(subgraph: Subgraph, output_path: str = None) -> Dict
     # Add edge type summary
     data['edge_type_summary'] = edge_types
     
-    # Sort nodes and edges for readability
-    data['nodes'].sort(key=lambda x: (x['type'], -x['score']))
+    # Nodes are already sorted by score (descending) from the loop above
+    # This order matches the top-k selection logic used in:
+    # 1. _prune_subgraph_topk() in graph_engine.py
+    # 2. final_answer.py when it slices nodes[:N]
+    # DO NOT re-sort here to maintain score-based order
+    
+    # Sort edges by type for readability
     data['edges'].sort(key=lambda x: x['type'])
     
     # Save to file if path provided

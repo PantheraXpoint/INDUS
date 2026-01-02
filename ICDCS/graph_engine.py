@@ -13,76 +13,41 @@ from AVA.prompt import PROMPTS
 
 # Import evaluation functions from time_ref.py
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-try:
-    from time_ref import time_to_seconds, percentage_overlap, overlap_reference_helper
-except ImportError:
-    # Fallback: define locally if import fails
-    def time_to_seconds(time_str: str):
-        if len(time_str.split(":")) == 2:
-            minutes, seconds = time_str.split(":")
-            return int(minutes) * 60 + int(seconds)
-        elif len(time_str.split(":")) == 3:
-            hours, minutes, seconds = time_str.split(":")
-            return int(hours) * 3600 + int(minutes) * 60 + int(seconds)
-        else:
-            raise ValueError(f"Invalid time string: {time_str}")
-    
-    def percentage_overlap(time_list: List[Tuple[int, int]], time_ref: Tuple[int, int]) -> float:
-        ref_start, ref_end = time_ref
-        if ref_end < ref_start:
-            return 0.0
-        if ref_start == ref_end:
-            point = ref_start
-            for start, end in time_list:
-                if end <= start:
-                    continue
-                if start <= point < end:
-                    return 1.0
-            return 0.0
-        ref_length = ref_end - ref_start
-        total_covered = 0
-        for start, end in time_list:
-            if end <= start:
-                continue
-            s = max(start, ref_start)
-            e = min(end, ref_end)
-            if e > s:
-                total_covered += (e - s)
-        return total_covered / ref_length if ref_length > 0 else 0.0
-    
-    def overlap_reference_helper(time_ref: str, time_list: List[Tuple[int, int]]):
-        if time_ref == "N/A" or time_ref == "" or time_ref == "None" or time_ref == "None-None":
-            return None
-        if "-" in time_ref:
-            start_time, end_time = time_ref.split("-")
-            if start_time in ["", "None"]:
-                start_time = end_time
-            if end_time in ["", "None"]:
-                end_time = start_time
-            start_time_seconds = time_to_seconds(start_time)
-            end_time_seconds = time_to_seconds(end_time)
-        elif "," in time_ref:
-            points_overlap = []
-            points = time_ref.split(",")
-            for point in points:
-                point = point.strip()
-                points_overlap.append(percentage_overlap(time_list, (time_to_seconds(point), time_to_seconds(point))))
-            return sum(points_overlap) / len(points_overlap)
-        else:
-            start_time_seconds = time_to_seconds(time_ref)
-            end_time_seconds = start_time_seconds
-        return percentage_overlap(time_list, (start_time_seconds, end_time_seconds))
+from time_ref import time_to_seconds, percentage_overlap, overlap_reference_helper
 
 class GraphEngine:
     def __init__(self, 
                  knowledge_graph: KnowledgeGraphInterface, 
                  context_graph: Optional[ContextGraphInterface] = None, 
                  scorer: Optional[GraphScorer] = None,
-                 llm = None):  # LLM for query rewriting/keyword extraction
+                 llm = None,
+                 constrained_propagation: bool = False,
+                 top_k_events: int = 5,
+                 top_k_objects: int = 5,
+                 adaptive_threshold: bool = False,
+                 threshold_percentile: int = 80,
+                 prize_based_seeds: bool = False,
+                 top_k_protected: int = 5):  
         self.kg = knowledge_graph
         self.context_graph = context_graph
         self.scorer = scorer
         self.llm = llm
+
+        # M4: Initialize query embedding storage
+        self.query_embedding = None
+
+        # M1: Store constrained propagation settings
+        self.constrained_propagation = constrained_propagation
+        self.top_k_events = top_k_events
+        self.top_k_objects = top_k_objects
+
+        # M3: Store adaptive threshold settings
+        self.adaptive_threshold = adaptive_threshold
+        self.threshold_percentile = threshold_percentile
+
+        # M7: Store prize-based seeds settings
+        self.prize_based_seeds = prize_based_seeds
+        self.top_k_protected = top_k_protected
         
         # === PER-QUERY STATE (reset each search) ===
         self._reset_query_state()
@@ -123,7 +88,7 @@ class GraphEngine:
         # Pruning Configuration
         self.pruning_config = {
             # STRICT BUDGET: 20 NODES
-            'max_total_nodes': 20,
+            'max_total_nodes': 50,
             
             # Dynamic Ratio: We no longer hard-cap events/objects.
             # They compete based on score.
@@ -131,11 +96,11 @@ class GraphEngine:
             'max_object_nodes': 20,
             
             # EDGE SAFETY: High limit to prevent "Prune Nodes -> Keep Edges -> Trigger Again" loop
-            'max_edges': 400,  
+            'max_edges': 2000,  
             
             # Saturation
             'score_saturation_threshold': 0.95,
-            'saturation_count_trigger': 10, # Scaled down for 50 nodes
+            'saturation_count_trigger': 25, 
             
             # Steiner tree settings
             'use_articulation_points': True,
@@ -155,6 +120,9 @@ class GraphEngine:
 
         # NEW: Track per-operation success
         self._op_stats = defaultdict(lambda: {'attempted': 0, 'added': 0})
+        
+        # Store best subgraph from Stage 1 (full exploration)
+        self.best_subgraph_stage1 = None
 
     
     def _get_cache_statistics(self) -> Dict:
@@ -223,111 +191,199 @@ class GraphEngine:
             List of iteration evaluation results
         """
         return self.iteration_metrics
+    
+    def _log_final_best_subgraph_evaluation(self, time_reference: str, force_subgraph: Optional[Subgraph] = None, stage_label: str = "FINAL"):
+        """
+        Evaluate ONLY the final best subgraph for official retrieval accuracy.
+        This is called AFTER all iterations complete.
+        
+        This provides the single "retrieval accuracy" metric that should be used
+        for performance evaluation, while iteration_metrics contains all subgraphs
+        for debugging purposes.
+        
+        Args:
+            time_reference: Time reference string from QA data
+            force_subgraph: If provided, evaluate this specific subgraph instead of finding best
+            stage_label: Label for logging (e.g., "STAGE 1", "STAGE 2")
+        """
+        if not time_reference or time_reference.strip() in ["N/A", "", "None", "None-None"]:
+            return
+        
+        # Use forced subgraph if provided, otherwise find best
+        if force_subgraph is not None:
+            best_subgraph = force_subgraph
+            best_score = self._calculate_answerability_score(best_subgraph)
+        else:
+            if not self.subgraphs:
+                print(f"  📊 {stage_label} Evaluation: No subgraphs to evaluate")
+                return
+            
+            # Select the final best subgraph using the same logic as select_best_subgraphs
+            best_subgraph = None
+            best_score = -1
+            
+            for sg in self.subgraphs:
+                if len(sg.nodes) < 2:  # Skip broken graphs
+                    continue
+                score = self._calculate_answerability_score(sg)
+                if score > best_score:
+                    best_score = score
+                    best_subgraph = sg
+            
+            if best_subgraph is None:
+                print(f"  📊 {stage_label} Evaluation: No valid subgraphs found")
+                return
+        
+        # Evaluate the best subgraph
+        best_result = self._evaluate_single_subgraph(best_subgraph, time_reference.strip())
+        
+        # Add to iteration_metrics as a special final entry
+        final_data = {
+            'iteration': stage_label.lower().replace(' ', '_'),
+            'note': f'{stage_label}: Official retrieval accuracy metric',
+            'total_subgraphs_in_pool': len(self.subgraphs),
+            'best_subgraph': best_result,
+            'answerability_score': best_score
+        }
+        self.iteration_metrics.append(final_data)
+        
+        # Print summary
+        if best_result and best_result['overlap'] is not None:
+            overlap = best_result['overlap']
+            print(f"\n  🎯 {stage_label} BEST SUBGRAPH EVALUATION")
+            print(f"     Subgraph ID: {best_result['subgraph_id']}")
+            print(f"     ⭐ Retrieval Accuracy (Overlap): {overlap:.3f}")
+            print(f"     Answerability Score: {best_score:.4f}")
+            print(f"     Composition: {best_result['num_events']}E/{best_result['num_objects']}O/{best_result['num_nodes']}N, {best_result['num_edges']}Edges")
+            if force_subgraph is None:
+                print(f"     (Selected from pool of {len(self.subgraphs)} subgraphs)")
+        else:
+            print(f"  🎯 {stage_label}: Best subgraph evaluation complete - no valid overlap")
 
     
-    def _evaluate_subgraphs(self, time_reference: str) -> List[Dict]:
+    def _evaluate_single_subgraph(self, subgraph: Subgraph, time_reference: str) -> Dict:
         """
-        Evaluate overlap for each subgraph separately.
+        Evaluate overlap for a SINGLE subgraph.
         
         DEBUG + SELF-HEALING MODE: 
         1. Scans for bad nodes (missing time/empty objects).
         2. BREAKPOINT triggers on detection to allow inspection.
         3. Prunes bad nodes to prevent crash and continues execution.
+        
+        Args:
+            subgraph: The subgraph to evaluate
+            time_reference: Time reference string from QA data
+        
+        Returns:
+            Dictionary with evaluation results for this subgraph
+        """
+        # --- 1. CLEANUP PASS: Identify and remove bad nodes ---
+        nodes_to_remove = []
+        
+        # Iterate safely over copy of items to allow modification later
+        for node_id, node in list(subgraph.nodes.items()):
+            # A. Validate EVENTS
+            if node.type == 'event':
+                has_valid_time = False
+                
+                # Check 'duration' [start, end]
+                if 'duration' in node.metadata and isinstance(node.metadata['duration'], (list, tuple)) and len(node.metadata['duration']) >= 2:
+                    float(node.metadata['duration'][0])
+                    float(node.metadata['duration'][1])
+                    has_valid_time = True
+                if not has_valid_time and 'start_time' in node.metadata:
+                    float(node.metadata['start_time'])
+                    has_valid_time = True
+                if not has_valid_time and 'timestamps' in node.metadata and isinstance(node.metadata['timestamps'], (list, tuple)) and len(node.metadata['timestamps']) >= 2:
+                    float(node.metadata['timestamps'][0])
+                    has_valid_time = True
+                if not has_valid_time:
+                    print("\n" + "!"*60)
+                    print(f"🚨 FOUND CORRUPT EVENT NODE: {node_id}")
+                    print(f"   Node Type: {node.type}")
+                    print(f"   Metadata keys: {list(node.metadata.keys())}")
+                    print(f"   Full Metadata: {node.metadata}")
+                    print("!"*60)
+                    print("🛑 Pausing for inspection. Type 'c' to PRUNE this node and continue.")
+                    # breakpoint() # <--- EXECUTION STOPS HERE
+                    
+                    # Mark for removal
+                    nodes_to_remove.append(node_id)
+
+            # B. Validate OBJECTS
+            elif node.type == 'object':
+                # If object has absolutely no metadata or content
+                if not node.content and not node.metadata:
+                    print("\n" + "!"*60)
+                    print(f"🚨 FOUND EMPTY OBJECT NODE: {node_id}")
+                    print("!"*60)
+                    print("🛑 Pausing for inspection. Type 'c' to PRUNE this node and continue.")
+                    # breakpoint() # <--- EXECUTION STOPS HERE
+                    
+                    nodes_to_remove.append(node_id)
+        
+        # Execute removal (Safe Pruning)
+        if nodes_to_remove:
+            print(f"✂️  Pruning {len(nodes_to_remove)} bad nodes from subgraph {subgraph.id}...")
+            for node_id in nodes_to_remove:
+                subgraph.remove_node(node_id)
+
+        # --- 2. EVALUATION PASS (Safe on cleaned graph) ---
+        time_list = []
+        for node in subgraph.nodes.values():
+            # We can now safely access metadata because bad nodes are gone
+            start_time_seconds = 0.0
+            end_time_seconds = 0.0
+            found_time = False
+            if node.type == 'event':
+                meta = node.metadata
+                if 'duration' in meta:
+                    start_time_seconds = float(meta['duration'][0])
+                    end_time_seconds = float(meta['duration'][1])
+                    found_time = True
+            elif node.type == 'object':
+                for duration in node.metadata["durations"]:
+                    start_time_seconds_i = float(duration[0])
+                    end_time_seconds_i = float(duration[1])
+                    if end_time_seconds_i > start_time_seconds_i:
+                        time_list.append((start_time_seconds_i, end_time_seconds_i))
+            
+            if found_time and end_time_seconds > start_time_seconds:
+                time_list.append((start_time_seconds, end_time_seconds))
+        
+        # Evaluate overlap
+        overlap = overlap_reference_helper(time_reference, time_list)
+        
+        # Collect statistics
+        objects = subgraph.get_nodes_by_type('object')
+        result = {
+            'subgraph_id': subgraph.id,
+            'overlap': overlap,
+            'num_nodes': len(subgraph.nodes),
+            'num_events': len(subgraph.get_nodes_by_type('event')),
+            'num_objects': len(objects),
+            'num_edges': len(subgraph.edges)
+        }
+        
+        return result
+    
+    def _evaluate_subgraphs(self, time_reference: str) -> List[Dict]:
+        """
+        Evaluate overlap for each subgraph separately.
+        
+        This method evaluates ALL subgraphs and is kept for backward compatibility
+        or special debugging purposes. For iteration evaluation, use 
+        _evaluate_single_subgraph() on the best subgraph instead.
         """
         results = []
         for subgraph in self.subgraphs:
-            # --- 1. CLEANUP PASS: Identify and remove bad nodes ---
-            nodes_to_remove = []
-            
-            # Iterate safely over copy of items to allow modification later
-            for node_id, node in list(subgraph.nodes.items()):
-                # A. Validate EVENTS
-                if node.type == 'event':
-                    has_valid_time = False
-                    
-                    # Check 'duration' [start, end]
-                    if 'duration' in node.metadata and isinstance(node.metadata['duration'], (list, tuple)) and len(node.metadata['duration']) >= 2:
-                        float(node.metadata['duration'][0])
-                        float(node.metadata['duration'][1])
-                        has_valid_time = True
-                    if not has_valid_time and 'start_time' in node.metadata:
-                        float(node.metadata['start_time'])
-                        has_valid_time = True
-                    if not has_valid_time and 'timestamps' in node.metadata and isinstance(node.metadata['timestamps'], (list, tuple)) and len(node.metadata['timestamps']) >= 2:
-                        float(node.metadata['timestamps'][0])
-                        has_valid_time = True
-                    if not has_valid_time:
-                        print("\n" + "!"*60)
-                        print(f"🚨 FOUND CORRUPT EVENT NODE: {node_id}")
-                        print(f"   Node Type: {node.type}")
-                        print(f"   Metadata keys: {list(node.metadata.keys())}")
-                        print(f"   Full Metadata: {node.metadata}")
-                        print("!"*60)
-                        print("🛑 Pausing for inspection. Type 'c' to PRUNE this node and continue.")
-                        # breakpoint() # <--- EXECUTION STOPS HERE
-                        
-                        # Mark for removal
-                        nodes_to_remove.append(node_id)
-
-                # B. Validate OBJECTS
-                elif node.type == 'object':
-                    # If object has absolutely no metadata or content
-                    if not node.content and not node.metadata:
-                        print("\n" + "!"*60)
-                        print(f"🚨 FOUND EMPTY OBJECT NODE: {node_id}")
-                        print("!"*60)
-                        print("🛑 Pausing for inspection. Type 'c' to PRUNE this node and continue.")
-                        # breakpoint() # <--- EXECUTION STOPS HERE
-                        
-                        nodes_to_remove.append(node_id)
-            
-            # Execute removal (Safe Pruning)
-            if nodes_to_remove:
-                print(f"✂️  Pruning {len(nodes_to_remove)} bad nodes from subgraph {subgraph.id}...")
-                for node_id in nodes_to_remove:
-                    subgraph.remove_node(node_id)
-
-            # --- 2. EVALUATION PASS (Safe on cleaned graph) ---
-            time_list = []
-            for node in subgraph.nodes.values():
-                # We can now safely access metadata because bad nodes are gone
-                start_time_seconds = 0.0
-                end_time_seconds = 0.0
-                found_time = False
-                if node.type == 'event':
-                    meta = node.metadata
-                    if 'duration' in meta:
-                        start_time_seconds = float(meta['duration'][0])
-                        end_time_seconds = float(meta['duration'][1])
-                        found_time = True
-                elif node.type == 'object':
-                    for duration in node.metadata["durations"]:
-                        start_time_seconds_i = float(duration[0])
-                        end_time_seconds_i = float(duration[1])
-                        if end_time_seconds_i > start_time_seconds_i:
-                            time_list.append((start_time_seconds_i, end_time_seconds_i))
-                
-                if found_time and end_time_seconds > start_time_seconds:
-                    time_list.append((start_time_seconds, end_time_seconds))
-            
-            # Evaluate overlap
-            overlap = overlap_reference_helper(time_reference, time_list)
-            
-            # Collect statistics
-            objects = subgraph.get_nodes_by_type('object')
-            results.append({
-                'subgraph_id': subgraph.id,
-                'overlap': overlap,
-                'num_nodes': len(subgraph.nodes),
-                'num_events': len(subgraph.get_nodes_by_type('event')),
-                'num_objects': len(objects),
-                'num_edges': len(subgraph.edges)
-            })
+            result = self._evaluate_single_subgraph(subgraph, time_reference)
+            results.append(result)
         return results
     
     def _log_iteration_evaluation(self, iteration_label: str, time_reference: str):
         """
-        Evaluate all subgraphs and store results in iteration_metrics.
+        Evaluate ALL subgraphs and store results in iteration_metrics (for debugging).
         
         Args:
             iteration_label: Label for this evaluation (e.g., "iteration_0_seeds", "iteration_1")
@@ -337,7 +393,7 @@ class GraphEngine:
             # No time reference available, skip evaluation
             return
         
-        # Evaluate all subgraphs
+        # Evaluate all subgraphs (for debugging)
         subgraph_results = self._evaluate_subgraphs(time_reference.strip())
         
         # Store in iteration_metrics
@@ -369,6 +425,8 @@ class GraphEngine:
         """
         print(f"--- Starting Search: '{query}' ---")
         self._reset_query_state()
+
+        self.query_embedding = query_embedding
         
         # 1. Initialization
         self._initial_exploration(query)
@@ -389,8 +447,53 @@ class GraphEngine:
             # Expansion
             for subgraph in self.subgraphs[:]:
                 
-                active_events = subgraph.get_nodes_by_type('event')
-                active_objects = subgraph.get_nodes_by_type('object')
+                # ====================================================================
+                # M1: CONSTRAINED PROPAGATION
+                # ====================================================================
+                if self.constrained_propagation:
+                    # Get all nodes by type
+                    all_events = subgraph.get_nodes_by_type('event')
+                    all_objects = subgraph.get_nodes_by_type('object')
+                    
+                    # Sort by score descending (highest scores first)
+                    all_events.sort(key=lambda n: n.score, reverse=True)
+                    all_objects.sort(key=lambda n: n.score, reverse=True)
+                    
+                    # Take only top-k
+                    active_events = all_events[:self.top_k_events]
+                    active_objects = all_objects[:self.top_k_objects]
+                    
+                    # Debug output
+                    print(f"  [M1] Constrained propagation: "
+                        f"{len(active_events)}/{len(all_events)} events, "
+                        f"{len(active_objects)}/{len(all_objects)} objects")
+                else:
+                    # Original behavior: expand from ALL nodes
+                    active_events = subgraph.get_nodes_by_type('event')
+                    active_objects = subgraph.get_nodes_by_type('object')
+
+
+                # ====================================================================
+                # M3: ADAPTIVE THRESHOLD
+                # ====================================================================
+                score_threshold = self._calculate_adaptive_threshold(subgraph)
+                
+                if self.adaptive_threshold:
+                    print(f"  [M3] Adaptive threshold: {score_threshold:.4f} "
+                        f"({self.threshold_percentile}th percentile)")
+                
+                # Filter nodes by adaptive threshold
+                active_events = [e for e in active_events if e.score >= score_threshold]
+                active_objects = [o for o in active_objects if o.score >= score_threshold]
+                
+                if self.adaptive_threshold:
+                    print(f"  [M3] After threshold filter: "
+                        f"{len(active_events)} events, {len(active_objects)} objects")
+
+
+                # ====================================================================
+                # EXPANSION OPERATIONS (unchanged)
+                # ====================================================================
                 
                 # 1. Expand Events (Structure + Vector)
                 for event in active_events:
@@ -428,6 +531,38 @@ class GraphEngine:
         print(f"\n--- Post-Processing ---")
         self._finalize_all_subgraphs()
 
+        # 4. Final Best Subgraph Evaluation (Stage 1: Full Exploration)
+        # ================================================================
+        # STAGE 1 EVALUATION ONLY
+        # Stages 2-4 (LLM pruning variants) are now generated on-demand
+        # by calculate_accuracy.py to avoid re-running benchmarks
+        # ================================================================
+        if time_reference:
+            print(f"\n{'='*80}")
+            print("STAGE 1 EVALUATION: After Full Exploration")
+            print(f"{'='*80}")
+            
+            # Find and store best subgraph for Stage 1
+            for sg in self.subgraphs:
+                if len(sg.nodes) < 2:
+                    continue
+                score = self._calculate_answerability_score(sg)
+                if self.best_subgraph_stage1 is None or score > self._calculate_answerability_score(self.best_subgraph_stage1):
+                    self.best_subgraph_stage1 = sg
+            
+            # Evaluate Stage 1
+            self._log_final_best_subgraph_evaluation(
+                time_reference, 
+                force_subgraph=self.best_subgraph_stage1,
+                stage_label="STAGE_1"
+            )
+            
+            print(f"\n{'='*80}")
+            print("Note: Stages 2-4 (LLM pruning) will be generated on-demand")
+            print("by calculate_accuracy.py from the Stage 1 subgraph.")
+            print(f"{'='*80}\n")
+
+        # Rest of existing code unchanged
         print("\n📊 Operation Statistics (Diagnosis):")
         for op, stats in self._op_stats.items():
             print(f"  - {op}: Attempted {stats['attempted']} -> Added {stats['added']}")
@@ -436,6 +571,7 @@ class GraphEngine:
         if not valid_subgraphs:
             print("❌ FINAL ERROR: No non-empty subgraphs remain for aggregation!")
             return "No information found.", []
+
 
         answer, final_subgraphs = self._aggregation(query)
         
@@ -465,6 +601,46 @@ class GraphEngine:
                          neighbors.add(edge.source_id)
         return neighbors
 
+    def _calculate_adaptive_threshold(self, subgraph: Subgraph) -> float:
+        """
+        M3: Calculate adaptive threshold based on score distribution.
+        
+        Instead of fixed threshold (0.001), use percentile-based threshold
+        that adapts to the current score distribution.
+        
+        Args:
+            subgraph: Current subgraph to analyze
+            
+        Returns:
+            float: Threshold value to use for filtering nodes
+        """
+        if not self.adaptive_threshold:
+            return 0.001  # Default fixed threshold if M3 disabled
+        
+        # Get all node scores
+        scores = [node.score for node in subgraph.nodes.values()]
+        
+        if len(scores) == 0:
+            return 0.001  # Fallback if no nodes
+        
+        # Sort scores to calculate percentile
+        scores.sort()
+        
+        # Calculate percentile index
+        # Example: 80th percentile of [0.1, 0.2, 0.3, 0.4, 0.5] is 0.4
+        percentile_idx = int(len(scores) * (self.threshold_percentile / 100.0))
+        percentile_idx = min(percentile_idx, len(scores) - 1)  # Stay within bounds
+        
+        threshold = scores[percentile_idx]
+        
+        # Safety bounds: never go below 0.01 or above 0.5
+        # This prevents:
+        # - Too aggressive filtering (< 0.01 would keep almost nothing)
+        # - Too permissive filtering (> 0.5 would keep everything)
+        threshold = max(0.01, min(0.5, threshold))
+        
+        return threshold
+
     # ------------------------------------------------------------------
     # Operations
     # ------------------------------------------------------------------
@@ -481,8 +657,12 @@ class GraphEngine:
         hub_size = len(kg_ids)
         if hub_size == 0: return
 
+        # M4: Add embeddings
         energy = self.scorer.calculate_energy_transfer(
-            source.score, 'event_object', self.current_iteration, hub_size=hub_size
+            source.score, 'event_object', self.current_iteration, 
+            hub_size=hub_size,
+            parent_embedding=source.embedding,        # NEW
+            query_embedding=self.query_embedding      # NEW
         )
         for oid in kg_ids:
             self._update_or_create_node(oid, 'object', energy, subgraph, source, 'event_object')
@@ -507,8 +687,12 @@ class GraphEngine:
         
         if len(kg_ids) == 0: return
         
+        # M4: Add embeddings
         energy = self.scorer.calculate_energy_transfer(
-            source.score, 'object_event', self.current_iteration, global_uniqueness=global_count
+            source.score, 'object_event', self.current_iteration, 
+            global_uniqueness=global_count,
+            parent_embedding=source.embedding,        # NEW
+            query_embedding=self.query_embedding      # NEW
         )
         for eid in kg_ids:
             self._update_or_create_node(eid, 'event', energy, subgraph, source, 'object_event')
@@ -530,10 +714,13 @@ class GraphEngine:
         # 2. Calculate Energy for the Target Objects
         # We treat this as a 1-hop structural connection
         hub_size = len(relations)
+        # M4: Add embeddings
         energy_target = self.scorer.calculate_energy_transfer(
             source.score, 'structure_object', 
             current_iteration=self.current_iteration, 
-            hub_size=hub_size
+            hub_size=hub_size,
+            parent_embedding=source.embedding,        # NEW
+            query_embedding=self.query_embedding      # NEW
         )
         
         for rel_node in relations:
@@ -559,8 +746,11 @@ class GraphEngine:
         target_ids = self._get_context_neighbors(source.id, 'context_event')
         if not target_ids: return
 
+        # M4: Add embeddings
         energy = self.scorer.calculate_energy_transfer(
-            source.score, 'context_event', self.current_iteration
+            source.score, 'context_event', self.current_iteration,
+            parent_embedding=source.embedding,        # NEW
+            query_embedding=self.query_embedding      # NEW
         ) 
         for tid in target_ids:
             self._update_or_create_node(tid, 'event', energy, subgraph, source, 'context_event')
@@ -578,9 +768,12 @@ class GraphEngine:
             self._cache_stats['vector_searches']['object_to_object']['misses'] += 1
         
         for res_node in results:
+            # M4: Add query_embedding (node_embedding and parent_embedding already passed)
             energy = self.scorer.calculate_energy_transfer(
                 source.score, 'vector_object', self.current_iteration,
-                node_embedding=res_node.embedding, parent_embedding=source.embedding
+                node_embedding=res_node.embedding, 
+                parent_embedding=source.embedding,
+                query_embedding=self.query_embedding      # NEW
             )
             self._update_or_create_node(res_node.id, 'object', energy, subgraph, source, 'vector_object', node_data=res_node)
 
@@ -597,9 +790,12 @@ class GraphEngine:
             self._cache_stats['vector_searches']['event_to_event']['misses'] += 1
         
         for res_node in results:
+            # M4: Add query_embedding (node_embedding and parent_embedding already passed)
             energy = self.scorer.calculate_energy_transfer(
                 source.score, 'vector_event', self.current_iteration,
-                node_embedding=res_node.embedding, parent_embedding=source.embedding
+                node_embedding=res_node.embedding, 
+                parent_embedding=source.embedding,
+                query_embedding=self.query_embedding      # NEW
             )
             self._update_or_create_node(res_node.id, 'event', energy, subgraph, source, 'vector_event', node_data=res_node)
 
@@ -676,19 +872,26 @@ class GraphEngine:
             kg_obj_ids = self.kg.get_objects_in_event(new_node.id)
             if kg_obj_ids:
                 hub_size = len(kg_obj_ids)
+                # M4: Add embeddings
                 energy = self.scorer.calculate_energy_transfer(
-                    new_node.score, 'event_to_object', 
-                    current_iteration=self.current_iteration, hub_size=hub_size
+                    new_node.score, 'event_object', 
+                    current_iteration=self.current_iteration, 
+                    hub_size=hub_size,
+                    parent_embedding=new_node.embedding,      # NEW
+                    query_embedding=self.query_embedding      # NEW
                 )
                 for tid in kg_obj_ids:
-                    triangulation_tasks.append((tid, energy, 'event_to_object', 'object'))
+                    triangulation_tasks.append((tid, energy, 'event_object', 'object'))
 
             # 2. Check Context Events (History)
             ctx_evt_ids = self._get_context_neighbors(new_node.id, 'event_to_event')
             if ctx_evt_ids:
+                # M4: Add embeddings
                 energy = self.scorer.calculate_energy_transfer(
                     new_node.score, 'context_event_to_event', 
-                    current_iteration=self.current_iteration
+                    current_iteration=self.current_iteration,
+                    parent_embedding=new_node.embedding,      # NEW
+                    query_embedding=self.query_embedding      # NEW
                 )
                 for tid in ctx_evt_ids:
                     triangulation_tasks.append((tid, energy, 'context_event_to_event', 'event'))
@@ -698,19 +901,26 @@ class GraphEngine:
             kg_evt_ids = self.kg.get_events_containing_object(new_node.id)
             if kg_evt_ids:
                 global_count = self.kg.get_global_event_count_for_object(new_node.id)
+                # M4: Add embeddings
                 energy = self.scorer.calculate_energy_transfer(
-                    new_node.score, 'object_to_event', 
-                    current_iteration=self.current_iteration, global_uniqueness=global_count
+                    new_node.score, 'object_event', 
+                    current_iteration=self.current_iteration, 
+                    global_uniqueness=global_count,
+                    parent_embedding=new_node.embedding,      # NEW
+                    query_embedding=self.query_embedding      # NEW
                 )
                 for tid in kg_evt_ids:
-                    triangulation_tasks.append((tid, energy, 'object_to_event', 'event'))
+                    triangulation_tasks.append((tid, energy, 'object_event', 'event'))
             
             # 2. Check Context Relations (Object -> Object)
             ctx_rel_ids = self._get_context_neighbors(new_node.id, 'relation')
             if ctx_rel_ids:
+                # M4: Add embeddings
                 energy = self.scorer.calculate_energy_transfer(
                     new_node.score, 'context_relation', 
-                    current_iteration=self.current_iteration
+                    current_iteration=self.current_iteration,
+                    parent_embedding=new_node.embedding,      # NEW
+                    query_embedding=self.query_embedding      # NEW
                 )
                 for tid in ctx_rel_ids:
                     triangulation_tasks.append((tid, energy, 'context_relation', 'object'))
@@ -764,8 +974,8 @@ class GraphEngine:
             # Search using keywords (text-based search)
             # UPDATED: Use top_k=5 to match AVA's Tri-View Retrieval precision (was 45)
             # AVA settings: top_k_for_events = 5, top_k_for_entities = 5
-            init_events = self.kg.search_events_by_description(keywords_response, top_k=10)
-            init_objects = self.kg.search_objects_by_description(rewrite_entity_response, top_k=10)
+            init_events = self.kg.search_events_by_description(keywords_response, top_k=5)
+            init_objects = self.kg.search_objects_by_description(rewrite_entity_response, top_k=5)
 
         # --- DEBUG CHECKPOINT A ---
         print(f"📊 CHECKPOINT A: Retrieval Results")
@@ -898,9 +1108,13 @@ class GraphEngine:
                 if subgraph.has_node(oid):
                     # Still need to query for hub_size calculation
                     all_obj_ids = self.kg.get_objects_in_event(event.id)
+                    # M4: Add embeddings
                     energy = self.scorer.calculate_energy_transfer(
-                        event.score, 'event_to_object', 
-                        current_iteration=self.current_iteration, hub_size=len(all_obj_ids)
+                        event.score, 'event_object', 
+                        current_iteration=self.current_iteration, 
+                        hub_size=len(all_obj_ids),
+                        parent_embedding=event.embedding,     # NEW
+                        query_embedding=self.query_embedding  # NEW
                     )
                     subgraph.add_edge(Edge(event.id, oid, 'seed_connection', energy))
         
@@ -910,9 +1124,13 @@ class GraphEngine:
             for eid in connected_evt_ids:
                 if subgraph.has_node(eid):
                     global_count = self.kg.get_global_event_count_for_object(obj.id)
+                    # M4: Add embeddings
                     energy = self.scorer.calculate_energy_transfer(
-                        obj.score, 'object_to_event', 
-                        current_iteration=self.current_iteration, global_uniqueness=global_count
+                        obj.score, 'object_event', 
+                        current_iteration=self.current_iteration, 
+                        global_uniqueness=global_count,
+                        parent_embedding=obj.embedding,       # NEW
+                        query_embedding=self.query_embedding  # NEW
                     )
                     subgraph.add_edge(Edge(obj.id, eid, 'seed_connection', energy))
     
@@ -1130,31 +1348,76 @@ class GraphEngine:
         max_total = config['max_total_nodes']
         terminals = set()
         
-        # 1. Identify seeds (Always keep)
-        seeds = [n for n in subgraph.nodes.values() if n.metadata.get('is_seed', False)]
-        for seed in seeds:
-            terminals.add(seed.id)
+        # ====================================================================
+        # 1. Identify seeds with M7 Prize-Based Protection
+        # ====================================================================
+        all_seeds = [n for n in subgraph.nodes.values() if n.metadata.get('is_seed', False)]
+        
+        if self.prize_based_seeds and len(all_seeds) > 0:
+            # M7: Sort seeds by score descending
+            all_seeds.sort(key=lambda n: n.score, reverse=True)
             
+            # Protect only top-k seeds
+            num_protected = min(self.top_k_protected, len(all_seeds))
+            protected_seeds = all_seeds[:num_protected]
+            
+            # Assign descending prizes to protected seeds
+            for i, seed in enumerate(protected_seeds):
+                prize = num_protected - i  # k, k-1, k-2, ..., 1
+                
+                # Boost score with prize (multiplicative)
+                boost_factor = 1.0 + (prize / (num_protected * 2))
+                seed.score *= boost_factor
+                
+                # Add to terminals
+                terminals.add(seed.id)
+            
+            # Debug output
+            print(f"  [M7] Prize-based seeds: protected {num_protected}/{len(all_seeds)} "
+                f"seeds (prizes: {num_protected} to 1)")
+            
+            # Unprotected seeds are NOT added to terminals (can compete with other nodes)
+            if len(all_seeds) > num_protected:
+                unprotected_count = len(all_seeds) - num_protected
+                print(f"  [M7] {unprotected_count} low-scoring seeds competing with non-seeds")
+        else:
+            # Original behavior: protect ALL seeds
+            for seed in all_seeds:
+                terminals.add(seed.id)
+            
+            if all_seeds and not self.prize_based_seeds:
+                print(f"  [M7] Protected all {len(all_seeds)} seeds (M7 disabled)")
+        
+        # ====================================================================
         # 2. Reserve buffer for Steiner Bridges (20% or min 5)
-        # This ensures we have space to connect the high-scoring nodes later
+        # ====================================================================
         bridge_buffer = max(5, int(max_total * 0.2))
         available_slots = max_total - len(terminals) - bridge_buffer
         
         if available_slots <= 0:
             return terminals
-            
-        # 3. Dynamic Selection: Sort ALL non-seed nodes by score
-        # Events and Objects compete fairly based on relevance
-        candidates = [
-            n for n in subgraph.nodes.values() 
-            if not n.metadata.get('is_seed', False)
-        ]
+        
+        # ====================================================================
+        # 3. Dynamic Selection: Sort ALL non-terminal nodes by score
+        # ====================================================================
+        # This includes:
+        # - Non-seed nodes (events and objects)
+        # - Unprotected seeds (if M7 enabled)
+        candidates = []
+        for node in subgraph.nodes.values():
+            # Skip nodes already in terminals (protected seeds)
+            if node.id in terminals:
+                continue
+            # Include all other nodes (non-seeds + unprotected seeds)
+            candidates.append(node)
+        
+        # Sort by score descending (boosted protected seeds already in terminals)
         candidates.sort(key=lambda n: n.score, reverse=True)
         
-        # Take top N candidates
+        # Take top N candidates to fill available slots
         for node in candidates[:available_slots]:
             terminals.add(node.id)
-            
+        
         return terminals
     
     def _find_steiner_nodes(self, subgraph: Subgraph, terminals: Set[str], max_count: int) -> Set[str]:
@@ -1415,7 +1678,7 @@ class GraphEngine:
         
         return total_energy
 
-    def _aggregation(self, query, selection_mode: str = 'budget'):
+    def _aggregation(self, query, selection_mode: str = 'best'):
         """
         Aggregate final results by selecting the best subgraphs.
         

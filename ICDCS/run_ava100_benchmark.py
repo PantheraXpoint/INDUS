@@ -293,12 +293,19 @@ class AVA100Benchmark:
             # self.current_ctx = None
             # self.active_connection_aliases.append(f'milvus_{video_key}_context')
             
-            self.current_scorer = GraphScorer()
+            self.current_scorer = GraphScorer(base_decay=0.8, alpha=0.7, beta=0.3) # M4
             self.current_graph_engine = GraphEngine(
                 self.current_kg, 
                 self.current_ctx, 
                 self.current_scorer, 
-                llm=self.llm
+                llm=self.llm,
+                constrained_propagation=False, # M1
+                top_k_events=15,
+                top_k_objects=15,
+                adaptive_threshold=False, # M3
+                threshold_percentile=80,
+                prize_based_seeds=False, # M7
+                top_k_protected=5
             )
             self.current_video_key = video_key
             
@@ -362,12 +369,21 @@ class AVA100Benchmark:
                 summary_path = export_all_subgraphs(all_ranked, str(output_subdir), query=query, qa_data=qa_data)
                 print(f"   All subgraphs exported to: {output_subdir}/")
             
-            # Export best subgraph with query metadata
+            # Export STAGE 1 ONLY
+            # Stage 1: Full exploration (best subgraph after iterative expansion + pruning)
+            # Stages 2-4 will be generated on-demand by calculate_accuracy.py
+            stage1_sg = getattr(engine, 'best_subgraph_stage1', None)
+            
+            # Save Stage 1 as "best_subgraph.json"
             if best_subgraph:
                 best_path = output_subdir / f"best_subgraph{postfix}.json"
                 
-                # Export base subgraph data
-                best_data = export_subgraph_to_json(best_subgraph, str(best_path))
+                # Export base subgraph data WITH pruning config
+                best_data = export_subgraph_to_json(
+                    best_subgraph, 
+                    str(best_path),
+                    pruning_config=engine.pruning_config  # Include pruning config for calculate_accuracy.py
+                )
                 
                 # Add query metadata to the JSON
                 with open(best_path, 'r') as f:
@@ -384,16 +400,16 @@ class AVA100Benchmark:
                     'processing_time_seconds': (end_time - start_time).total_seconds(),
                     'max_iterations': max_iterations,
                     'num_total_subgraphs': len(all_ranked),
-                    'note': 'This is ranked #1 (best) out of all subgraphs by Answerability Score'
+                    'note': 'Stage 1: Best subgraph after full exploration. Stages 2-4 generated on-demand by calculate_accuracy.py'
                 }
                 
                 # Save enriched data
                 with open(best_path, 'w') as f:
                     json.dump(best_data, f, indent=2)
                 
-                print(f"\n✅ Best subgraph saved to: {best_path}")
+                print(f"\n✅ Stage 1 subgraph saved to: {best_path}")
                 print(f"   Nodes: {len(best_subgraph.nodes)}, Edges: {len(best_subgraph.edges)}")
-                print(f"   Query metadata included in JSON")
+                print(f"   Note: Stages 2-4 will be generated on-demand by calculate_accuracy.py")
             
             # Save detailed cache statistics to file
             cache_stats = engine._get_cache_statistics()
@@ -441,7 +457,9 @@ class AVA100Benchmark:
                 'processing_time_seconds': (end_time - start_time).total_seconds(),
                 'output_path': str(output_subdir / "best_subgraph.json") if best_subgraph else None,
                 'all_subgraphs_dir': str(output_subdir),
-                'subgraphs_ranked': True  # Indicate exported subgraphs are ranked
+                'subgraphs_ranked': True,  # Indicate exported subgraphs are ranked
+                'stage1_nodes': len(stage1_sg.nodes) if stage1_sg else 0,
+                'note': 'Stage 1 only. Stages 2-4 generated on-demand by calculate_accuracy.py'
             }
             
             print(f"⏱️  Processing time: {result['processing_time_seconds']:.2f}s")

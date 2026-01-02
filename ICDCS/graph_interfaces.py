@@ -63,6 +63,55 @@ class Subgraph:
             'iteration': 0
         }
         self.current_iteration = 0
+    
+    @classmethod
+    def from_json(cls, json_data: Dict) -> 'Subgraph':
+        """
+        Reconstruct a Subgraph object from JSON data.
+        
+        This is the inverse of export_subgraph_to_json() from export_subgraph.py.
+        It allows loading previously exported subgraphs for post-processing,
+        analysis, or applying different pruning strategies.
+        
+        Args:
+            json_data: Dictionary containing subgraph data (from JSON file)
+        
+        Returns:
+            Reconstructed Subgraph instance
+        
+        Example:
+            >>> import json
+            >>> with open('best_subgraph.json', 'r') as f:
+            >>>     data = json.load(f)
+            >>> subgraph = Subgraph.from_json(data)
+        """
+        # Create subgraph with original ID
+        subgraph = cls(id=json_data.get('subgraph_id', str(uuid.uuid4())))
+        
+        # Reconstruct nodes
+        for node_data in json_data.get('nodes', []):
+            node = Node(
+                id=node_data['id'],
+                type=node_data['type'],
+                score=float(node_data.get('score', 0.0)),
+                embedding=None,  # Embeddings not stored in JSON (too large)
+                content=node_data.get('content', ''),
+                metadata=node_data.get('metadata', {})
+            )
+            subgraph.add_node(node)
+        
+        # Reconstruct edges
+        for edge_data in json_data.get('edges', []):
+            edge = Edge(
+                source_id=edge_data['source_id'],
+                target_id=edge_data['target_id'],
+                type=edge_data['type'],
+                score=float(edge_data.get('score', 0.0)),
+                metadata=edge_data.get('metadata', {})
+            )
+            subgraph.add_edge(edge)
+        
+        return subgraph
 
     def add_node(self, node: Node):
         self.nodes[node.id] = node

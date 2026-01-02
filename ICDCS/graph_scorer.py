@@ -6,17 +6,21 @@ from sklearn.metrics.pairwise import cosine_similarity
 class GraphScorer:
     def __init__(self, 
                  base_decay: float = 0.8, 
-                 target_event_obj_ratio: float = 0.33):
+                 alpha: float = None,
+                 beta: float = None):
         self.base_decay = base_decay
-        self.target_ratio = target_event_obj_ratio
+
+        # NEW: Dual-component weights
+        self.alpha = alpha  # Structure importance
+        self.beta = beta    # Query relevance importance
         
         # Policy: EQUAL TRUST for all operations
         self.trust_map = {
             'init': 1.0,
             
             # Structure
-            'event_to_object': 0.9, 
-            'object_to_event': 0.9,
+            'event_object': 0.9, 
+            'object_event': 0.9,
             
             # Vector / Inference
             'vector_object': 0.9,   
@@ -38,14 +42,14 @@ class GraphScorer:
         return float(cosine_similarity(vec_a, vec_b)[0][0])
 
     def calculate_energy_transfer(self, 
-                                  source_score: float, 
-                                  op_type: str, 
-                                  current_iteration: int = 1,
-                                  hub_size: int = 1,
-                                  global_uniqueness: int = 1,
-                                  node_embedding: Optional[np.ndarray] = None,
-                                  parent_embedding: Optional[np.ndarray] = None,
-                                  query_embedding: Optional[np.ndarray] = None) -> float:
+                              source_score: float, 
+                              op_type: str, 
+                              current_iteration: int = 1,
+                              hub_size: int = 1,
+                              global_uniqueness: int = 1,
+                              node_embedding: Optional[np.ndarray] = None,
+                              parent_embedding: Optional[np.ndarray] = None,
+                              query_embedding: Optional[np.ndarray] = None) -> float:
         """
         Calculates how much 'Heat' flows from Parent -> Child based on heuristics.
         
@@ -56,6 +60,7 @@ class GraphScorer:
         base_trust = self.trust_map.get(op_type, 0.9)
         
         energy = source_score * self.base_decay * base_trust
+        
         # 2. Structural Penalties/Bonuses
         
         # A. Hub Penalty (Logarithmic) - For Event->Object
@@ -69,23 +74,34 @@ class GraphScorer:
             uniqueness_factor = 1.0 / (math.log(safe_uniq + 1) * 0.5)
             energy *= min(1.5, uniqueness_factor) 
 
-        # 3. Vector Logic (Compass Rule + Plot Twist Override)
-        # Only applied for Vector Operations
-        if 'vector' in op_type and query_embedding is not None and node_embedding is not None:
-            global_sim = self.compute_similarity(node_embedding, query_embedding)
-            
+        # ========================================================================
+        # 3. M4: DUAL-COMPONENT SCORING (REPLACES OLD VECTOR LOGIC)
+        # ========================================================================
+        # Apply to ALL operations (not just vector) if embeddings are available
+        if self.alpha is not None and self.beta is not None and node_embedding is not None:
+            # Component 1: Structural similarity (parent-child relationship)
             if parent_embedding is not None:
-                local_sim = self.compute_similarity(node_embedding, parent_embedding)
-                
-                # Plot Twist Logic: Trust Strong Local links (>0.85) over Global Context
-                if local_sim > 0.85:
-                    relevance = (0.8 * local_sim) + (0.2 * global_sim)
-                else:
-                    relevance = (0.2 * local_sim) + (0.8 * global_sim)
+                structural_sim = self.compute_similarity(node_embedding, parent_embedding)
             else:
-                relevance = global_sim
-                
-            energy *= relevance
+                structural_sim = 1.0  # No parent = direct seed connection, full trust
+            
+            # Component 2: Query relevance (how well node matches query)
+            if query_embedding is not None:
+                query_sim = self.compute_similarity(node_embedding, query_embedding)
+            else:
+                query_sim = 0.5  # Default if no query embedding available
+            
+            # Combine with learned weights (alpha + beta should sum to 1.0)
+            # alpha = importance of structural relationship
+            # beta = importance of query relevance
+            relevance_score = self.alpha * structural_sim + self.beta * query_sim
+            
+            # Apply relevance to energy
+            energy *= relevance_score
+            
+            # Optional debug print (remove after testing)
+            # print(f"  [M4] struct={structural_sim:.3f}, query={query_sim:.3f}, "
+            #       f"relevance={relevance_score:.3f}, op={op_type}")
 
         # 4. Time-Based Damping (Score Convergence Prevention)
         # Formula: energy / ln(iteration + 2)
