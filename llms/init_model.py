@@ -12,8 +12,10 @@ model_zoo = {
     "qwenvl_vllm": QwenVL_vllm
 }
 
-def init_model(model_name, num_gpus=1):
+def init_model(model_name, num_gpus=1, model_type=None, port=8000):
     if model_name not in model_zoo:
         supported_models = ", ".join(model_zoo.keys())
         raise ValueError(f"Model {model_name} not found in model_zoo. Supported models: {supported_models}")
+    if model_type is not None:
+        return model_zoo[model_name](model_type=model_type, tp=num_gpus, port=port)
     return model_zoo[model_name](tp=num_gpus)

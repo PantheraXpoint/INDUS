@@ -21,6 +21,7 @@ from ICDCS.graph_interfaces import KnowledgeGraphInterface, ContextGraphInterfac
 from ICDCS.graph_scorer import GraphScorer
 from ICDCS.graph_engine import GraphEngine
 from ICDCS.export_subgraph import export_subgraph_to_json, export_all_subgraphs
+from ICDCS.final_answer import generate_question_list
 
 
 class AVA100Benchmark:
@@ -55,9 +56,10 @@ class AVA100Benchmark:
         print("INITIALIZING MODELS")
         print("=" * 80)
         self.embedding_model = JinaCLIP("jinaai/jina-clip-v1")
-        self.llm = init_model('qwenvl', 1)
+        # self.llm = init_model('qwenvl', 1)
         print("✅ Models initialized\n")
         print(f"💾 Memory threshold: {self.memory_threshold}%")
+        self.llm = init_model("qwenvl_vllm", num_gpus=1, model_type="Qwen/Qwen2.5-14B-Instruct-AWQ", port=8000)
     
     def _build_video_index_mapping(self):
         """
@@ -306,7 +308,7 @@ class AVA100Benchmark:
         
         return self.current_graph_engine
     
-    def run_single_query(self, video_key, query, question_id, qa_data, kg_dir, max_iterations=10):
+    def run_single_query(self, video_key, query, question_id, qa_data, kg_dir, max_iterations=10, postfix: str = ''):
         """
         Run graph engine for a single query using reusable engine instance.
         
@@ -362,7 +364,7 @@ class AVA100Benchmark:
             
             # Export best subgraph with query metadata
             if best_subgraph:
-                best_path = output_subdir / "best_subgraph.json"
+                best_path = output_subdir / f"best_subgraph{postfix}.json"
                 
                 # Export base subgraph data
                 best_data = export_subgraph_to_json(best_subgraph, str(best_path))
@@ -522,6 +524,8 @@ class AVA100Benchmark:
                 options = qa["options"]
                 concat_question = f"{question}\n{options[0]}\n{options[1]}\n{options[2]}\n{options[3]}"
                 query = concat_question
+                question_list = generate_question_list(query, "Reasoning", self.llm)
+                breakpoint()
                 question_id = qa['question_id']
                 
                 # Check cache first

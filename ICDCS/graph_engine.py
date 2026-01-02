@@ -122,25 +122,25 @@ class GraphEngine:
 
         # Pruning Configuration
         self.pruning_config = {
-            # STRICT BUDGET: 50 NODES
-            'max_total_nodes': 50,
+            # STRICT BUDGET: 20 NODES
+            'max_total_nodes': 20,
             
             # Dynamic Ratio: We no longer hard-cap events/objects.
             # They compete based on score.
-            'max_event_nodes': 50, 
-            'max_object_nodes': 50,
+            'max_event_nodes': 20, 
+            'max_object_nodes': 20,
             
             # EDGE SAFETY: High limit to prevent "Prune Nodes -> Keep Edges -> Trigger Again" loop
-            'max_edges': 1500,  
+            'max_edges': 400,  
             
             # Saturation
             'score_saturation_threshold': 0.95,
-            'saturation_count_trigger': 20, # Scaled down for 50 nodes
+            'saturation_count_trigger': 10, # Scaled down for 50 nodes
             
             # Steiner tree settings
             'use_articulation_points': True,
             'use_shortest_paths': True,
-            'shortest_path_node_limit': 100,
+            'shortest_path_node_limit': 50,
             'max_path_length': 3,
         }
 

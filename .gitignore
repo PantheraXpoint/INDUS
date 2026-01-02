@@ -1,6 +1,8 @@
 # AVA Cache Directory (symbolic link)
 AVA_cache
 AVA_cache/
+ava100_results_50_nodes_sg/
+ava100_results_M4/
 
 # Dataset directories (symbolic links)
 datas/

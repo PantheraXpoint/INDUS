@@ -6,7 +6,7 @@ import os
 import asyncio
 
 class QwenVL_vllm(BaseVideoModel):
-    def __init__(self, model_type="Qwen/Qwen2.5-14B-Instruct-AWQ", tp=1):
+    def __init__(self, model_type="Qwen/Qwen2.5-14B-Instruct-AWQ", tp=1, port=8000):
         """
         Initialize the QwenVL model.
 
@@ -16,7 +16,7 @@ class QwenVL_vllm(BaseVideoModel):
         """
         client = OpenAI(
             api_key=os.getenv("OPENAI_API_KEY", "dummy"),  # not checked by vLLM
-            base_url="http://localhost:8000/v1"            # your vLLM endpoint
+            base_url=f"http://localhost:{port}/v1"            # your vLLM endpoint
         )
         self.model_type = model_type
         self.client = client

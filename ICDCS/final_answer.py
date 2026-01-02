@@ -13,10 +13,12 @@ from PIL import Image
 import cv2
 import glob
 import time
-from time_ref import overlap_reference_helper
+import re
+import ast
 
-# Add parent directory to path for imports
+# Add parent directory to path for imports (must be before importing time_ref)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from time_ref import overlap_reference_helper
 
 try:
     from AVA.prompt import PROMPTS
@@ -28,6 +30,26 @@ except ImportError:
     prompt_module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(prompt_module)
     PROMPTS = prompt_module.PROMPTS
+
+def extract_questions_from_response(response):
+    questions = []
+
+    # Find all vqa("...") entries (single string argument)
+    single_q_matches = re.findall(r'vqa\("([^"]+)"\)', response)
+    questions.extend(single_q_matches)
+
+    # Find vqa([...]) blocks (list of questions)
+    list_q_matches = re.findall(r'vqa\(\s*(\[[^\]]*\])\s*\)', response)
+    for list_q_str in list_q_matches:
+        try:
+            # Safely evaluate the string to a list
+            list_q = ast.literal_eval(list_q_str)
+            if isinstance(list_q, list):
+                questions.extend(list_q)
+        except Exception:
+            pass  # ignore malformed lists
+
+    return questions
 
 def extract_frames_for_event_pair(
     video_path: str,
@@ -179,6 +201,57 @@ def find_connected_event_pairs(
     return event_pairs
 
 
+def find_graph_json_path(graph_folder_path: str, graph_filename: Optional[str] = None) -> str:
+    """
+    Find the graph JSON file path with fallback logic.
+    
+    Args:
+        graph_folder_path: Path to the folder containing graph JSON files
+        graph_filename: Optional custom filename (e.g., "best_subgraph_stage2_budget20.json")
+                       If None or not found, falls back to "best_subgraph.json"
+        
+    Returns:
+        Path to the graph JSON file to use
+    """
+    # If custom filename is provided, try to use it
+    if graph_filename:
+        custom_path = os.path.join(graph_folder_path, graph_filename)
+        if os.path.exists(custom_path):
+            return custom_path
+    
+    # Fall back to default
+    default_path = os.path.join(graph_folder_path, "best_subgraph.json")
+    return default_path
+
+def load_graph_data_with_metadata(graph_folder_path: str, graph_filename: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Load graph data and ensure query_metadata exists.
+    If the custom graph file doesn't have query_metadata, load it from best_subgraph.json.
+    
+    Args:
+        graph_folder_path: Path to the folder containing graph JSON files
+        graph_filename: Optional custom filename
+        
+    Returns:
+        Dictionary containing the graph data with query_metadata
+    """
+    graph_json_path = find_graph_json_path(graph_folder_path, graph_filename)
+    graph_data = load_graph_data(graph_json_path)
+    
+    # If query_metadata is missing, try to load it from best_subgraph.json
+    if 'query_metadata' not in graph_data or not graph_data.get('query_metadata'):
+        default_path = os.path.join(graph_folder_path, "best_subgraph.json")
+        if os.path.exists(default_path) and default_path != graph_json_path:
+            try:
+                default_data = load_graph_data(default_path)
+                if 'query_metadata' in default_data:
+                    graph_data['query_metadata'] = default_data['query_metadata']
+                    print(f"Loaded query_metadata from {default_path}")
+            except Exception as e:
+                print(f"Warning: Could not load query_metadata from {default_path}: {e}")
+    
+    return graph_data
+
 def load_graph_data(json_path: str) -> Dict[str, Any]:
     """
     Load the knowledge graph data from JSON file.
@@ -214,7 +287,7 @@ def check_overlap(nodes: List[Dict[str, Any]], time_reference: str):
     return overlap
 
 
-def format_nodes_as_segments(graph_data: Dict[str, Any], limited_ratio: float, time_reference: str) -> str:
+def format_nodes_as_segments(graph_data: Dict[str, Any], limited_ratio: float, time_reference: str, event_nodes: List[str] = None) -> str:
     """
     Format graph nodes (events and objects) into a readable segment format.
     Groups objects under their associated events.
@@ -243,26 +316,30 @@ def format_nodes_as_segments(graph_data: Dict[str, Any], limited_ratio: float, t
     print(f"Limited edges: {len(edges)}")
     # Create mappings for quick lookup
     node_map = {node['id']: node for node in nodes}
-    events = [node for node in nodes if node.get('type') == 'event']
+    events = [node for node in nodes if node.get('type') == 'event' and node['id'] in event_nodes]
+    # events = [node for node in nodes if node.get('type') == 'event']
     objects = {node['id']: node for node in nodes if node.get('type') == 'object'}
     
     # Build mapping: event_id -> list of object_ids connected to it
     event_to_objects: Dict[str, List[str]] = {}
-    
+    graph_statistics = {
+        'event_count': len(events),
+        'object_count': len(objects),
+    }
     for edge in edges:
         edge_type = edge.get('type', '')
         source_id = edge.get('source_id', '')
         target_id = edge.get('target_id', '')
         
         # Handle event_to_object edges
-        if edge_type == 'event_to_object' and source_id in node_map and target_id in objects:
+        if (edge_type == 'event_object' or edge_type == 'event_to_object') and source_id in node_map and target_id in objects:
             if source_id not in event_to_objects:
                 event_to_objects[source_id] = []
             if target_id not in event_to_objects[source_id]:
                 event_to_objects[source_id].append(target_id)
         
         # Handle object_to_event edges (reverse direction)
-        elif edge_type == 'object_to_event' and target_id in node_map and source_id in objects:
+        elif (edge_type == 'object_event' or edge_type == 'object_to_event') and target_id in node_map and source_id in objects:
             if target_id not in event_to_objects:
                 event_to_objects[target_id] = []
             if source_id not in event_to_objects[target_id]:
@@ -293,8 +370,8 @@ def format_nodes_as_segments(graph_data: Dict[str, Any], limited_ratio: float, t
         
         # Get objects associated with this event
         associated_objects = event_to_objects.get(event_id, [])
-        if len(associated_objects) > 5:
-            associated_objects = associated_objects[:5]
+        # if len(associated_objects) > 10:
+        #     associated_objects = associated_objects[:10]
         
         if associated_objects:
             segments.append(f"Objects in Event {event_id}:")
@@ -323,7 +400,7 @@ def format_nodes_as_segments(graph_data: Dict[str, Any], limited_ratio: float, t
             segments.append("(No objects associated)")
             segments.append("")
     
-    return "\n".join(segments), overlap
+    return "\n".join(segments), overlap, graph_statistics
 
 
 def format_graph_summary(graph_data: Dict[str, Any]) -> str:
@@ -353,11 +430,123 @@ def format_graph_summary(graph_data: Dict[str, Any]) -> str:
     
     return "\n".join(summary_parts)
 
+def generate_question_list(query: str, prompt_template: str, llm_model: Optional[Any] = None) -> List[str]:
+    """
+    Generate a list of questions from a query using a prompt template.
+    """
+    prompt_template_str = PROMPTS[prompt_template]
+    formatted_prompt = prompt_template_str.format(
+        question_and_options=query
+    )
+    response = llm_model.batch_generate_response([{"text": formatted_prompt}], max_new_tokens=512, temperature=0.5)[0]
+
+    question_list = extract_questions_from_response(
+        response
+    )
+    return question_list
+
+def generate_reasoning_answer(
+    graph_folder_path: str,
+    prompt_template: str = "Reasoning",
+    llm_model: Optional[Any] = None,
+    event_to_event_descriptions: List[str] = None,
+    event_nodes: List[str] = None,
+    graph_filename: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Generate a reasoning answer to a query using knowledge graph information.
+    """
+        # Load graph data
+    graph_json_path = find_graph_json_path(graph_folder_path, graph_filename)
+    if not os.path.exists(graph_json_path):
+        return {
+            'error': f"Graph JSON file not found: {graph_json_path}"
+        }
+    graph_data = load_graph_data_with_metadata(graph_folder_path, graph_filename)
+
+    # Find the summary json file in the graph folder
+    query = graph_data.get('query_metadata', {}).get('query', "")
+
+    if query is None or query == "":
+        raise ValueError("Query is not found in the summary file")
+    
+    question_list = generate_question_list(query, prompt_template, llm_model)
+
+    if len(question_list) <= 1:
+        return None
+    batch_inputs = []
+    for question in question_list:
+        batch_inputs.append({"text": question})
+    batch_outputs = llm_model.batch_generate_response(batch_inputs, max_new_tokens=512, temperature=0.5)
+    question_list = [output for output in batch_outputs]
+    results = []
+    for question in question_list:
+        # Format the graph information as video segments
+        time_reference = graph_data["query_metadata"]["time_reference"]
+        video_segments, overlap, graph_statistics = format_nodes_as_segments(graph_data, limited_ratio=1.0, time_reference=time_reference, event_nodes=event_nodes)
+        graph_statistics['edges'] = len(event_to_event_descriptions)
+        # Get the prompt template
+        if prompt_template not in PROMPTS:
+            raise ValueError(f"Prompt template '{prompt_template}' not found. Available templates: {list(PROMPTS.keys())}")
+        
+        prompt_template_str = PROMPTS["generate_reasoning_answer"]
+        
+        # Format the prompt with the query and video segments
+        formatted_prompt = prompt_template_str.format(
+            user_query=question,
+            video_segments=video_segments,
+            event_to_event_descriptions="\n".join(event_to_event_descriptions)
+        )
+        
+        results.append({
+            'query': question,
+            'prompt_template': prompt_template,
+            'formatted_prompt': formatted_prompt,
+            'graph_statistics': graph_statistics,
+            'overlap': overlap,
+        })
+        
+    # Generate answer using LLM if provided
+    if llm_model is not None:
+        try:
+            # Prepare input for LLM
+            llm_input = []
+            for result in results:
+                llm_input.append({"text": result['formatted_prompt']})
+            
+            # Generate response
+            if hasattr(llm_model, 'batch_generate_response'):
+                responses = llm_model.batch_generate_response(llm_input, max_new_tokens=512, temperature=0.5)
+            else:
+                raise ValueError("LLM model must have 'generate_response' or 'batch_generate_response' method")
+            
+            for result, response in zip(results, responses):
+                result['llm_response'] = response
+            
+            # Try to parse JSON response if it's in JSON format
+            try:
+                import re
+                # Extract JSON from response if it's wrapped in markdown code blocks
+                breakpoint()
+                for result in results:
+                    analysis_match = re.search(r'"Analysis"\s*:\s*"([^"]*)"', result['llm_response'])
+                    result['analysis'] = analysis_match.group(1) if analysis_match else result['llm_response']
+            except Exception as e:
+                for result in results:
+                    result['analysis'] = None
+        except Exception as e:
+            for result in results:
+                result['error'] = str(e)
+                result['analysis'] = None
+    return results
+    
+
 def generate_e2e_answer(
     graph_folder_path: str,
     prompt_template: str = "summary_and_answer",
     llm_model: Optional[Any] = None,
-    video_path: Optional[str] = None
+    video_path: Optional[str] = None,
+    graph_filename: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     Generate an end-to-end answer to a query using knowledge graph information.
@@ -368,17 +557,18 @@ def generate_e2e_answer(
         prompt_template: Name of the prompt template to use (default: "summary_and_answer")
         llm_model: Optional LLM model instance to generate the answer
         use_summary: Whether to include graph summary in the prompt
+        graph_filename: Optional custom graph JSON filename (falls back to "best_subgraph.json" if not found)
         
     Returns:
         Dictionary containing the answer, analysis, and formatted prompt
     """
     # Load graph data
-    graph_json_path = os.path.join(graph_folder_path, "best_subgraph.json")
+    graph_json_path = find_graph_json_path(graph_folder_path, graph_filename)
     if not os.path.exists(graph_json_path):
         return {
             'error': f"Graph JSON file not found: {graph_json_path}"
         }
-    graph_data = load_graph_data(graph_json_path)
+    graph_data = load_graph_data_with_metadata(graph_folder_path, graph_filename)
 
     # Find the summary json file in the graph folder
     query = graph_data.get('query_metadata', {}).get('query', "")
@@ -391,10 +581,16 @@ def generate_e2e_answer(
     
     # Format event connections description
     connection_descriptions = []
-    
-    for pair in event_pairs[:10]:  # Limit to first 10 pairs to avoid overwhelming
+    event_nodes = []
+    for pair in event_pairs[:50]:  # Limit to first 10 pairs to avoid overwhelming
         event1_id = pair['event1_id']
         event2_id = pair['event2_id']
+        if event1_id not in event_nodes:
+            event_nodes.append(event1_id)
+        if event2_id not in event_nodes:
+            event_nodes.append(event2_id)
+        if len(event_nodes) > 20:
+            break
         event1_desc = pair['event1_description']
         event2_desc = pair['event2_description']
         edge_score = pair.get('edge_score', 0.0)
@@ -414,7 +610,7 @@ def generate_e2e_answer(
     # Extract frames for event pairs if video path is provided and LLM supports video
     frames_list = []
     if video_path and os.path.exists(video_path) and llm_model is not None:
-        for pair in event_pairs[:10]:  # Limit to 5 pairs for frame extraction
+        for pair in event_pairs[:50]:  # Limit to 5 pairs for frame extraction
             frames = extract_frames_for_event_pair(
                 video_path=video_path,
                 event1_start=int(pair['event1_start']),
@@ -466,7 +662,7 @@ def generate_e2e_answer(
         print(f"Time taken for VLM generation: {end_time - start_time} seconds")
         for result, output in zip(results, batch_outputs):
             result['llm_response'] = output
-    return results
+    return results, event_nodes
 
 
 def generate_final_answer(
@@ -474,6 +670,8 @@ def generate_final_answer(
     prompt_template: str = "summary_and_answer",
     llm_model: Optional[Any] = None,
     event_to_event_descriptions: List[str] = None,
+    event_nodes: List[str] = None,
+    graph_filename: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     Generate an answer to a query using knowledge graph information.
@@ -484,13 +682,14 @@ def generate_final_answer(
         prompt_template: Name of the prompt template to use (default: "summary_and_answer")
         llm_model: Optional LLM model instance to generate the answer
         use_summary: Whether to include graph summary in the prompt
+        graph_filename: Optional custom graph JSON filename (falls back to "best_subgraph.json" if not found)
         
     Returns:
         Dictionary containing the answer, analysis, and formatted prompt
     """
     # Load graph data
-    graph_json_path = os.path.join(graph_folder_path, "best_subgraph.json")
-    graph_data = load_graph_data(graph_json_path)
+    graph_json_path = find_graph_json_path(graph_folder_path, graph_filename)
+    graph_data = load_graph_data_with_metadata(graph_folder_path, graph_filename)
     query = graph_data.get('query_metadata', {}).get('query', "")
     query = query + " " + ", ".join(graph_data.get('query_metadata', {}).get('options', []))
 
@@ -499,8 +698,8 @@ def generate_final_answer(
     
     # Format the graph information as video segments
     time_reference = graph_data["query_metadata"]["time_reference"]
-    video_segments, overlap = format_nodes_as_segments(graph_data, limited_ratio=1.0, time_reference=time_reference)
-    
+    video_segments, overlap, graph_statistics = format_nodes_as_segments(graph_data, limited_ratio=1.0, time_reference=time_reference, event_nodes=event_nodes)
+    graph_statistics['edges'] = len(event_to_event_descriptions)
     # Get the prompt template
     if prompt_template not in PROMPTS:
         raise ValueError(f"Prompt template '{prompt_template}' not found. Available templates: {list(PROMPTS.keys())}")
@@ -518,7 +717,7 @@ def generate_final_answer(
         'query': query,
         'prompt_template': prompt_template,
         'formatted_prompt': formatted_prompt,
-        'graph_statistics': graph_data.get('statistics', {}),
+        'graph_statistics': graph_statistics,
         'overlap': overlap,
     }
     
@@ -558,71 +757,109 @@ def generate_final_answer(
     return result
 
 
-def run_ava_100_benchmark(graph_folder: str, video_path: str):
+def run_ava_100_benchmark(graph_folder: str, video_path: str, vlm_port: int = 8002, llm_port: int = 8000, llm_only: bool = False, postfix: str = '', graph_filename: Optional[str] = None):
     # Initialize LLM model if specified
     vlm_model = None
-    llm_model = None
+    llm_model = None    
     try:
         from llms.init_model import init_model
-        vlm_model = init_model("qwenvl", num_gpus=1)
-        llm_model = init_model("qwenvl_vllm", num_gpus=1)
+        vlm_model = init_model("qwenvl_vllm", num_gpus=1, model_type="Qwen/Qwen2.5-VL-7B-Instruct-AWQ", port=vlm_port)
+        llm_model = init_model("qwenvl_vllm", num_gpus=1, model_type="Qwen/Qwen2.5-14B-Instruct-AWQ", port=llm_port)
         print(f"Initialized VLM model: qwenvl and LLM model: qwenvl_vllm")
     except Exception as e:
         print(f"Warning: Could not initialize LLM model: {e}")
         print("Continuing without LLM model...")
     questions_folder = glob.glob(os.path.join(graph_folder, "q*"))
+    replace_str = "_llm_only" if llm_only else "_full"
+    replace_str = replace_str + "_" + postfix
     for question_folder in sorted(questions_folder):
         # Save to file if specified
-        output = f"{question_folder}/final_answer.json"
-        # if os.path.exists(output):
-        #     continue
+        output = f"{question_folder}/final_answer{replace_str}.json"
+        # Check if file exists and is complete (has more than just time_taken)
+        should_skip = False
+        if os.path.exists(output):
+            try:
+                with open(output, 'r', encoding='utf-8') as f:
+                    existing_data = json.load(f)
+                    # If file has more than just time_taken, skip it
+                    if len(existing_data) > 1 or 'query' in existing_data or 'formatted_prompt' in existing_data:
+                        should_skip = True
+            except:
+                # If file is corrupted, regenerate it
+                pass
+        if should_skip:
+            print(f"Skipping {output} (already exists and is complete)")
+            continue
         start_time = time.time()
         # Generate answer
-        e2e_results = generate_e2e_answer(
-            graph_folder_path=question_folder,
-            prompt_template="generate_event_to_event_description",
-            llm_model=vlm_model,
-            video_path=video_path
-        )
+        if not llm_only:
+            e2e_results, event_nodes = generate_e2e_answer(
+                graph_folder_path=question_folder,
+                prompt_template="generate_event_to_event_description",
+                llm_model=vlm_model,
+                video_path=video_path,
+                graph_filename=graph_filename
+            )
 
-        result = generate_final_answer(
-            graph_folder_path=question_folder,
-            prompt_template="generate_final_answer_with_e2e",
-            llm_model=llm_model,
-            event_to_event_descriptions=[e2e_result['llm_response'] for e2e_result in e2e_results]
-        )
+            result = generate_final_answer(
+                graph_folder_path=question_folder,
+                prompt_template="generate_final_answer_with_e2e",
+                llm_model=llm_model,
+                event_to_event_descriptions=[e2e_result['llm_response'] for e2e_result in e2e_results],
+                event_nodes=event_nodes,
+                graph_filename=graph_filename
+            )
+        else:
+            result = generate_final_answer(
+                graph_folder_path=question_folder,
+                prompt_template="generate_final_answer_with_e2e",
+                llm_model=llm_model,
+                event_to_event_descriptions=[],
+                graph_filename=graph_filename
+            )
         end_time = time.time()
+        
+        # Ensure result is a dictionary
+        if result is None:
+            result = {'error': 'generate_final_answer returned None'}
+        elif not isinstance(result, dict):
+            result = {'error': f'generate_final_answer returned unexpected type: {type(result)}'}
+        
         result['time_taken'] = end_time - start_time
         print(f"Time taken: {result['time_taken']} seconds")
+        
+        # Debug: Print what keys are in result
+        print(f"Result keys: {list(result.keys())}")
+        
         # Print results
         print("\n" + "="*80)
         print("QUERY:")
         print("="*80)
-        print(result['query'])
+        print(result.get('query',''))
         
         print("\n" + "="*80)
         print("GRAPH STATISTICS:")
         print("="*80)
-        for key, value in result['graph_statistics'].items():
+        for key, value in result.get('graph_statistics',{}).items():
             print(f"  {key}: {value}")
         
         if result.get('answer'):
             print("\n" + "="*80)
             print("ANSWER:")
             print("="*80)
-            print(result['answer'])
+            print(result.get('answer',''))
             
             if result.get('analysis'):
                 print("\n" + "="*80)
                 print("ANALYSIS:")
                 print("="*80)
-                print(result['analysis'])
+                print(result.get('analysis',''))
         
         if result.get('error'):
             print("\n" + "="*80)
             print("ERROR:")
             print("="*80)
-            print(result['error'])
+            print(result.get('error',''))
         
         with open(output, 'w', encoding='utf-8') as f:
             json.dump(result, f, indent=4, ensure_ascii=False)
@@ -631,7 +868,7 @@ def run_ava_100_benchmark(graph_folder: str, video_path: str):
         # Optionally print formatted prompt (can be very long)
         prompt_file = output.replace('.json', '_prompt.txt')
         with open(prompt_file, 'w', encoding='utf-8') as f:
-            f.write(result['formatted_prompt'] + "\n")
+            f.write(result.get('formatted_prompt','') + "\n")
         print(f"Formatted prompt saved to: {prompt_file}")
 
 
@@ -737,6 +974,11 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description='Generate answers from queries using knowledge graph')
     parser.add_argument('--video_range', type=str, help='Video range')
+    parser.add_argument('--vlm_port', type=int, default=8002, help='VLM port')
+    parser.add_argument('--llm_port', type=int, default=8000, help='LLM port')
+    parser.add_argument('--llm_only', action='store_true', help='Only run LLM')
+    parser.add_argument('--postfix', type=str, default='', help='Postfix for output file')
+    parser.add_argument('--graph_filename', type=str, default=None, help='Custom graph JSON filename (e.g., "best_subgraph_stage2_budget20.json"). Falls back to "best_subgraph.json" if not found.')
     # main()
     args = parser.parse_args()
     video_range = args.video_range.split("-")
@@ -745,5 +987,5 @@ if __name__ == "__main__":
     for idx, dataset_name in enumerate(dataset_names):
         if idx < video_range[0] or idx > video_range[1]:
             continue
-        run_ava_100_benchmark(graph_folder=f"ava100_results/{dataset_name}", video_path=f"datas/AVA100/videos/{dataset_name}.mp4")
+        run_ava_100_benchmark(graph_folder=f"50_nodes_limit_seeds_10/ava100_results/{dataset_name}", video_path=f"datas/AVA100/videos/{dataset_name}.mp4", vlm_port=args.vlm_port, llm_port=args.llm_port, llm_only=args.llm_only, postfix=args.postfix, graph_filename=args.graph_filename)
 
