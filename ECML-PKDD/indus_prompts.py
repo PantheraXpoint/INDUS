@@ -234,6 +234,242 @@ Options: {options}
 **Think step by step, then output ONLY the JSON:**
 """
 
+INDUS_PROMPT["temporal_analysis_lvbench"] = """
+You are a temporal analysis expert for LVBench videos. Extract time information from the question.
+
+**IMPORTANT CONTEXT:**
+- LVBench videos do NOT show time counters/clock displays in the video frames
+- All times in questions/options refer to VIDEO TIMELINE positions (MM:SS or HH:MM:SS format)
+- Times with AM/PM (like "9 a.m", "10 a.m") are clock times shown in the video content, NOT video timeline positions
+
+---
+
+**LOCALIZATION TIME = Video timeline positions where we should search for events**
+
+✅ These ARE localization times (video timeline positions):
+- Explicit timestamps in question: "at 3:45", "from 8:00 to 8:05", "around 22:35", "between 5:15 and 5:20"
+- Time ranges in question: "from 02:03-04:09", "11:35-16:15"
+- Times in options that are video positions: "3:10", "2:40" (when question asks "how long does timer show" or "what time interval")
+- Video positions: "at the beginning of the video", "at the end of the video"
+- Standalone position: "at the beginning", "at the end", "at the start" (with NO other words after)
+
+❌ These are NOT localization times:
+- Times with AM/PM: "9 a.m", "10 a.m", "9.30 a.m" → These are content_time (clock times visible in video)
+- Scores/race times: "29:32.120", "27:30.42" (when question asks "how long did game take" or "what is the score") → These are content_time
+- Activity endings: "at the end of [ANY ACTIVITY]" (e.g., "end of cement work", "end of cooking")
+- Activity transitions: "after [ACTIVITY]", "before [ACTIVITY]", "when [ACTIVITY] is done"
+- Sequence words: "first ingredient", "second step", "final move" (unless it says "first scene of video")
+
+**Key Rule for LVBench:**
+- If time is MM:SS or HH:MM:SS WITHOUT AM/PM → Check: Is it asking WHERE in video to search? → YES, localization_time
+- If time has AM/PM → content_time (clock time visible in video)
+- If time is a score/duration answer (like "29:32.120" for "how long did game take") → content_time
+
+---
+
+**CONTENT TIME = Times visible IN the video (on clocks, displays, screens) or answer values**
+
+These are content times:
+- Times with AM/PM: "9 a.m", "10 a.m", "9.30 a.m", "8 a.m"
+- Questions asking "what time is shown", "what time was it when"
+- Scores/race times when question asks about them: "29:32.120" (game duration), "27:30.42" (score)
+
+---
+
+**Output Format (JSON):**
+{{
+  "localization_time": {{
+    "exists": true or false,
+    "type": "exact" or "range" or "multiple" or "position" or "none",
+    "value": "HH:MM" or {{"start": "HH:MM", "end": "HH:MM"}} or ["HH:MM", {{"start": "HH:MM", "end": "HH:MM"}}] or "beginning" or "end" or null,
+    "values": [] (optional, for multiple time points/ranges)
+  }},
+  "content_time": {{
+    "exists": true or false,
+    "values": [] (list of times like ["9 a.m", "10 a.m"] or ["29:32.120"])
+  }}
+}}
+
+**Note:** For multiple time points/ranges, use "type": "multiple" and put all in "values" array. For single point/range, use "type": "exact"/"range" and put in "value".
+
+---
+
+**EXAMPLES - Study these carefully:**
+
+---
+INPUT:
+Question: "How long does the vlogger set the timer for when brushing her teeth?"
+Options: (A) 3:10 (B) 2:40 (C) 3:00 (D) 2:50
+
+REASONING:
+- Question asks about timer duration shown in video
+- Options have times: "3:10", "2:40", "3:00", "2:50" (MM:SS format, no AM/PM)
+- These are video timeline positions where timer shows these values
+- Rule: MM:SS/HH:MM:SS without AM/PM that indicate WHERE in video → localization_time
+
+OUTPUT:
+{{
+  "localization_time": {{"exists": true, "type": "multiple", "values": ["3:10", "2:40", "3:00", "2:50"]}},
+  "content_time": {{"exists": false, "values": []}}
+}}
+
+---
+INPUT:
+Question: "What is the video time interval that the vlogger visit the cultural center?"
+Options: (A) 11:35-16:15 (B) 11:35-14:15 (C) 10:35-14:15 (D) 10:35-16:15
+
+REASONING:
+- Question explicitly asks "video time interval"
+- Options have time ranges: "11:35-16:15", etc. (HH:MM format, no AM/PM)
+- These are video timeline ranges
+- Rule: Time ranges in video timeline → localization_time
+
+OUTPUT:
+{{
+  "localization_time": {{"exists": true, "type": "multiple", "values": [{{"start": "11:35", "end": "16:15"}}, {{"start": "11:35", "end": "14:15"}}, {{"start": "10:35", "end": "14:15"}}, {{"start": "10:35", "end": "16:15"}}]}},
+  "content_time": {{"exists": false, "values": []}}
+}}
+
+---
+INPUT:
+Question: "When does the vlogger go out again?"
+Options: (A) 9 a.m (B) 10 a.m (C) 9.30 a.m (D) 8 a.m
+
+REASONING:
+- Options have times with AM: "9 a.m", "10 a.m", "9.30 a.m", "8 a.m"
+- Rule: Times with AM/PM → content_time (clock times visible in video)
+
+OUTPUT:
+{{
+  "localization_time": {{"exists": false, "type": "none", "value": null}},
+  "content_time": {{"exists": true, "values": ["9 a.m", "10 a.m", "9.30 a.m", "8 a.m"]}}
+}}
+
+---
+INPUT:
+Question: "When does the vlogger go home for the last time?"
+Options: (A) 16:49 (B) 12:30 (C) 15:51 (D) 19:50
+
+REASONING:
+- Question asks "when" (time position)
+- Options have times: "16:49", "12:30", "15:51", "19:50" (HH:MM format, no AM/PM)
+- These could be video timeline positions OR clock times shown in video
+- Context: Question asks "when" (position), not "what time is shown"
+- Rule: When question asks about WHEN something happens (position), and times have no AM/PM → localization_time
+
+OUTPUT:
+{{
+  "localization_time": {{"exists": true, "type": "multiple", "values": ["16:49", "12:30", "15:51", "19:50"]}},
+  "content_time": {{"exists": false, "values": []}}
+}}
+
+---
+INPUT:
+Question: "When does one of the break time end?"
+Options: (A) 07:34 (B) 36:25 (C) 10:58 (D) 06:44
+
+REASONING:
+- Question asks "when" (time position)
+- Options have times: "07:34", "36:25", "10:58", "06:44" (HH:MM or MM:SS format, no AM/PM)
+- These are video timeline positions
+- Rule: Times without AM/PM asking WHERE → localization_time
+
+OUTPUT:
+{{
+  "localization_time": {{"exists": true, "type": "multiple", "values": ["07:34", "36:25", "10:58", "06:44"]}},
+  "content_time": {{"exists": false, "values": []}}
+}}
+
+---
+INPUT:
+Question: "How long did the entire game take in total?"
+Options: (A) 29:32.120 (B) 26:17.53 (C) 32:12.320 (D) 28:49.850
+
+REASONING:
+- Question asks "how long" (duration/answer value)
+- Options have times: "29:32.120", "26:17.53" (with decimals, like race times)
+- These are ANSWER VALUES (game duration), not positions to search in video
+- Rule: Scores/durations as answers → content_time
+
+OUTPUT:
+{{
+  "localization_time": {{"exists": false, "type": "none", "value": null}},
+  "content_time": {{"exists": true, "values": ["29:32.120", "26:17.53", "32:12.320", "28:49.850"]}}
+}}
+
+---
+INPUT:
+Question: "What is the score of the champion?"
+Options: (A) 27:30.42 (B) 27:30.90 (C) 29:32.12 (D) 27:01.17
+
+REASONING:
+- Question asks "what is the score" (answer value)
+- Options have times: "27:30.42", "27:30.90" (with decimals, like race times/scores)
+- These are ANSWER VALUES (scores), not positions to search in video
+- Rule: Scores as answers → content_time
+
+OUTPUT:
+{{
+  "localization_time": {{"exists": false, "type": "none", "value": null}},
+  "content_time": {{"exists": true, "values": ["27:30.42", "27:30.90", "29:32.12", "27:01.17"]}}
+}}
+
+---
+INPUT:
+Question: "Around 3:45, was a pickup truck observed?"
+Options: A. Yes, black B. Yes, white
+
+REASONING:
+- Contains "3:45" in question → This is a timestamp (video timeline position)
+- Rule: timestamps in question → localization_time
+
+OUTPUT:
+{{
+  "localization_time": {{"exists": true, "type": "exact", "value": "3:45"}},
+  "content_time": {{"exists": false, "values": []}}
+}}
+
+---
+INPUT:
+Question: "What happens from 02:03-04:09?"
+Options: A. Pick beech nut B. Cook and eat
+
+REASONING:
+- Contains "02:03-04:09" → This is a time range (video timeline)
+- Rule: time ranges → localization_time
+
+OUTPUT:
+{{
+  "localization_time": {{"exists": true, "type": "range", "value": {{"start": "02:03", "end": "04:09"}}}},
+  "content_time": {{"exists": false, "values": []}}
+}}
+
+---
+INPUT:
+Question: "When does the animation end?"
+Options: (A) 69:43 (B) 70:43 (C) 69:33 (D) 70:33
+
+REASONING:
+- Question asks "when" (time position)
+- Options have times: "69:43", "70:43" (MM:SS format, no AM/PM)
+- These are video timeline positions
+- Rule: Times without AM/PM asking WHERE → localization_time
+
+OUTPUT:
+{{
+  "localization_time": {{"exists": true, "type": "multiple", "values": ["69:43", "70:43", "69:33", "70:33"]}},
+  "content_time": {{"exists": false, "values": []}}
+}}
+
+---
+
+**Now do this task:**
+Question: {question}
+Options: {options}
+
+**Think step by step, then output ONLY the JSON:**
+"""
+
 INDUS_PROMPT["keyword_strategy"] = """
 You are a keyword strategy expert. Decide WHERE to extract keywords: question, options, or both.
 

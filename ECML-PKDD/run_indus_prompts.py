@@ -34,7 +34,7 @@ FRAMES_CHECK_DIR = Path(__file__).resolve().parent / "temporal_verification_fram
 PHASE1_PROMPT_KEYS = ["temporal_analysis", "keyword_strategy", "query_type_classification"]
 PHASE2_PROMPT_KEYS = ["event_view_extraction", "entity_view_extraction", "visual_view_extraction"]
 TOP_K_PER_VIEW = 50
-BORDA_TOP_K = 20
+BORDA_TOP_K = 80
 S = 1
 
 
@@ -177,7 +177,12 @@ def run_phase1(dataset: str, port: int, model: str):
         print(f"[{idx + 1}/{total}] {dataset} video={video_key} question_id={question_id}")
         entry_meta = {"dataset": dataset, "video_key": video_key, "question_id": question_id, "question": question, "options": options_str}
         for key in PHASE1_PROMPT_KEYS:
-            prompt = indus_prompts.INDUS_PROMPT[key].format(question=question, options=options_str)
+            # Use LVBench-specific prompt for temporal_analysis when dataset is LVBench
+            if key == "temporal_analysis" and dataset == "LVBench":
+                prompt_key = "temporal_analysis_lvbench"
+            else:
+                prompt_key = key
+            prompt = indus_prompts.INDUS_PROMPT[prompt_key].format(question=question, options=options_str)
             out = llm.batch_generate_response([{"text": prompt}])[0]
             results[key].append({**entry_meta, "llm_output": out})
     for key in PHASE1_PROMPT_KEYS:
@@ -224,6 +229,69 @@ def _parse_temporal_analysis_raw(llm_output: str) -> dict:
         "parsed_localization_seconds": parsed_loc,
         "parsed_content_seconds": parsed_content,
     }
+
+
+def _lvbench_localization_time_segments_from_raw(llm_output: str) -> List[Tuple[int, int, str]]:
+    """
+    Parse LVBench localization_time into video timeline segments.
+    Handles single point, single range, or multiple points/ranges.
+    Returns list of (start_sec, end_sec, source_label).
+    Skips "position" type (beginning/end) for now.
+    """
+    segments: List[Tuple[int, int, str]] = []
+    out = (llm_output or "").strip()
+    if out.startswith("```"):
+        out = re.sub(r"^```\w*\n?", "", out).strip()
+        out = re.sub(r"\n?```$", "", out).strip()
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        return segments
+    loc = data.get("localization_time") or {}
+    if not loc.get("exists"):
+        return segments
+    loc_type = loc.get("type", "").lower()
+    # Skip "position" type for now
+    if loc_type == "position":
+        return segments
+    # Handle multiple values
+    if loc_type == "multiple":
+        values = loc.get("values") or []
+        for i, val in enumerate(values):
+            if isinstance(val, dict) and "start" in val and "end" in val:
+                start_str = str(val["start"]).strip()
+                end_str = str(val["end"]).strip()
+                if start_str and end_str:  # Check that strings are non-empty
+                    start_sec = _time_str_to_seconds(start_str)
+                    end_sec = _time_str_to_seconds(end_str)
+                    label = f"localization_time.values[{i}] (range: {start_str}-{end_str})"
+                    segments.append((min(start_sec, end_sec), max(start_sec, end_sec), label))
+            elif isinstance(val, str):
+                val_str = val.strip()
+                if val_str:  # Check that string is non-empty
+                    t_sec = _time_str_to_seconds(val_str)
+                    label = f"localization_time.values[{i}] (point: {val})"
+                    segments.append((t_sec, t_sec, label))
+    # Handle single value (exact point or range)
+    elif loc_type in ("exact", "range"):
+        val = loc.get("value")
+        if val is None:
+            return segments
+        if isinstance(val, dict) and "start" in val and "end" in val:
+            start_str = str(val["start"]).strip()
+            end_str = str(val["end"]).strip()
+            if start_str and end_str:  # Check that strings are non-empty
+                start_sec = _time_str_to_seconds(start_str)
+                end_sec = _time_str_to_seconds(end_str)
+                label = f"localization_time.value (range: {start_str}-{end_str})"
+                segments.append((min(start_sec, end_sec), max(start_sec, end_sec), label))
+        elif isinstance(val, str):
+            val_str = val.strip()
+            if val_str:  # Check that string is non-empty
+                t_sec = _time_str_to_seconds(val_str)
+                label = f"localization_time.value (point: {val})"
+                segments.append((t_sec, t_sec, label))
+    return segments
 
 
 def _build_phase1_lookup(dataset: str):
@@ -788,8 +856,31 @@ def run_phase2(dataset: str, port: int, model: str, vlm_port: Optional[int] = No
                         if ref_override_applied:
                             reference_used["ref_override_applied"] = True
                             reference_used["ref_override_video"] = video_key
-        elif dataset == "LVBench" and parsed_time_seconds is not None and len(parsed_time_seconds) >= 2:
-            q_start, q_end = parsed_time_seconds[0], parsed_time_seconds[1]
+        elif dataset == "LVBench" and temporal_parsed.get("has_localization"):
+            # LVBench: parse all localization_time segments (points and ranges) from raw LLM output
+            localization_segments = _lvbench_localization_time_segments_from_raw(temporal_llm_output)
+            if localization_segments:
+                all_video_starts = []
+                all_video_ends = []
+                for seg_i, (video_start, video_end, source_label) in enumerate(localization_segments):
+                    video_time_segments.append({"video_sec": [video_start, video_end], "source": source_label})
+                    overlap_ids_seg = _events_overlapping_segment(events_vdb, video_start, video_end)
+                    events_retrieved = []
+                    for eid in overlap_ids_seg:
+                        events_retrieved.append({"event_id": eid, "video_sec": [video_start, video_end]})
+                    seg_log = {
+                        "source": source_label,
+                        "video_sec": [video_start, video_end],
+                        "events_retrieved": events_retrieved,
+                    }
+                    temporal_segments_log.append(seg_log)
+                    for eid in overlap_ids_seg:
+                        event_to_temporal_sources.setdefault(eid, []).append(source_label)
+                    all_video_starts.append(video_start)
+                    all_video_ends.append(video_end)
+                if all_video_starts and all_video_ends:
+                    q_start = min(all_video_starts)
+                    q_end = max(all_video_ends)
 
         if event_to_temporal_sources:
             overlap_ids = list(dict.fromkeys(event_to_temporal_sources.keys()))
