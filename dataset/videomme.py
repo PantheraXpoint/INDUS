@@ -59,3 +59,8 @@ class VideoMME(Dataset):
             os.makedirs(work_path)
         
         return VideoRepresentation(source_path, work_path)
+    
+    def get_video_for_vlm(self, video_id: Union[int, str]):
+        """Get VideoRepresentation for VLM Direct - separate method to avoid breaking existing code"""
+        # For VideoMME, this is identical to get_video, but kept separate for consistency
+        return self.get_video(video_id)

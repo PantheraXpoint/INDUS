@@ -94,9 +94,26 @@ class AVA100(Dataset):
         
         self.videos_path = videos_path
         self.work_path = work_path
+        self.init_event_list_all = json.load(open("ECML-PKDD/ava100_retrieval/seed_events_AVA100.json", "r"))
     
     def __len__(self):
         pass
+    
+    def get_init_event_list(self, video_id: int, question_id: int):
+        source_name = self.get_video_info(video_id)["video_path"].split("/")[-1].split(".")[0]
+        seed_events = None
+        for event in self.init_event_list_all:
+            if event["video_key"] == source_name and event["question_id"] == question_id:
+                seed_events = event["seed_events"]
+        # get top 20
+        first_20_events = []
+        all_borda_events = []
+        for event in seed_events:
+            if event["borda_score"] is not None:
+                all_borda_events.append(event)
+        borda_events_sorted = sorted(all_borda_events, key=lambda x: x["borda_score"], reverse=True)
+        first_20_events.extend([event["id"] for event in borda_events_sorted[:20-len(first_20_events)]])
+        return first_20_events
     
     def get_video_info(self, video_id: Union[int, str]):
         video_id = int(video_id)

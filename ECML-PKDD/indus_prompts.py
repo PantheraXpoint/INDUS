@@ -1962,3 +1962,120 @@ Metadata: {metadata}
 
 Output (JSON only):
 """
+
+INDUS_PROMPT["query_event_extraction"] = """
+You are an event extraction specialist for video question answering. Given a question and its answer options about a video, extract a list of concrete, observable events or scenes that a relevant video segment would likely show.
+
+**Instructions:**
+- Extract 1-5 event descriptions that capture what should be visible in relevant video segments
+- Each event should describe an observable action, scene, or state (not abstract concepts)
+- Include events from BOTH the question and the options when the options describe different scenarios
+- Do NOT include timestamps, numbers, or spatial directions — focus on visual content only
+- Keep each event description short (one sentence)
+
+**Output JSON Format:**
+{{
+  "query_events": [
+    "description of expected event 1",
+    "description of expected event 2"
+  ]
+}}
+
+**Examples:**
+
+Example 1:
+Question: What color was the pickup truck?
+Options: (A) Black (B) White (C) Red (D) Blue
+Output:
+{{
+  "query_events": [
+    "A pickup truck is visible on the road or in a scene"
+  ]
+}}
+
+Example 2:
+Question: What did the person do after opening the refrigerator?
+Options: (A) Took out a bottle of milk (B) Closed the refrigerator (C) Started cooking (D) Left the kitchen
+Output:
+{{
+  "query_events": [
+    "A person opens a refrigerator",
+    "A person takes out a bottle of milk from the refrigerator",
+    "A person closes the refrigerator",
+    "A person is cooking in the kitchen",
+    "A person leaves the kitchen"
+  ]
+}}
+
+Example 3:
+Question: How many trucks passed the intersection between 9:50 and 10:00?
+Options: (A) 2 (B) 3 (C) 4 (D) 5
+Output:
+{{
+  "query_events": [
+    "A truck passes through an intersection"
+  ]
+}}
+
+Example 4:
+Question: What is the score at the end of the half?
+Options: (A) 38 - 31 (B) 38 - 34 (C) 67 - 61 (D) 67 - 60
+Output:
+{{
+  "query_events": [
+    "A scoreboard or score display is visible showing game scores"
+  ]
+}}
+
+Example 5:
+Question: Which direction does the person turn after passing the church?
+Options: (A) Left (B) Right (C) Turn around (D) Go straight
+Output:
+{{
+  "query_events": [
+    "A church is visible along the path",
+    "A person walks past a church and changes direction"
+  ]
+}}
+
+**Your Task:**
+Question: {question}
+Options: {options}
+
+Output (JSON only):
+"""
+
+INDUS_PROMPT["event_relevance_verification"]="""
+You are a relevance judge for video event matching. You will be given a list of expected events derived from a question about a video, and one candidate event description from a video knowledge graph. For EACH expected event, determine whether the candidate event is relevant to it.
+
+**Instructions:**
+- For each expected event, judge independently whether the candidate event matches or is closely related to it
+- Consider semantic similarity, not exact word matching — e.g., "a truck drives through a crossing" matches "a truck passes through an intersection"
+- An event showing the same entities, actions, or scenes as an expected event is relevant even if described differently
+- If the candidate event describes something completely unrelated to an expected event, answer "no" for that expected event
+- When in doubt, lean toward "yes" — it is better to keep a possibly relevant event than to discard a relevant one
+
+**Output Format:**
+Return a JSON list with exactly one "yes" or "no" per expected event, in the same order as the expected events list.
+Output ONLY the JSON list, no other text.
+
+**Example:**
+Expected events:
+1. A pickup truck is visible on the road
+2. A person inspects a vehicle
+3. A gas station is shown
+
+Candidate event description:
+[00:25:00 - 00:25:24] A red truck drives along the highway near a gas station
+
+Output:
+["yes", "no", "yes"]
+
+**Expected events from the query:**
+{query_events_formatted}
+
+**Candidate event description:**
+{candidate_event_description}
+
+**Output (JSON list only):**
+"""

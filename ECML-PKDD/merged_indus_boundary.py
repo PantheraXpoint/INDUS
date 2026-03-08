@@ -1,31 +1,32 @@
 #!/usr/bin/env python3
 """
-MERGED SCRIPT: Batch1-only INDUS (seeds ∪ FB(seeds), optional VLM)  ∩
-              Temporal clustering boundary → FB expansion (full/selective grounding).
+MERGED (Method A + Method B) with optional JSON cache.
 
-Final output per query:
-  final_ids = merge(methodA_ids, methodB_ids)
-Default merge = intersection ("selective of both").
+Method A:
+  - Top-K Borda seeds (borda_score None treated as +inf)
+  - candidates = seeds ∪ FB(seeds)
+  - budget cap
+  - optional VLM verify => verified_A (else verified_A = sent candidates)
 
-Method A (INDUS Batch1-only):
-  - seed_ids = Top-K Borda (borda_score None treated as +inf)
-  - fb_ids = forward_backward(seed_ids)
-  - candidates = seed_ids ∪ fb_ids
-  - budget cap: take first seeds then extras (deterministic)
-  - if --use-vlm: verify candidates with Prompt1+Prompt2 -> verified_A
-    else verified_A = candidates_sent
+Method B (NO clustering-based expansion):
+  - uses SAME Top-K seeds as Method A
+  - cache step:
+      * cluster Top-K seeds (time-gap) ONLY to detect cache hits
+      * for hit clusters: reuse cached cluster events (no expansion)
+      * remaining seeds: expand_and_metrics once from global boundary(first/last)
+  - kept_B = (Top-K seeds) ∪ (cached reused events) ∪ (expanded events from remaining seeds)
 
-Method B (clustering boundary FB expansion):
-  - top intervals -> merge_gap -> boundary_ids
-  - expand_and_metrics (run_fb=True, run_evo=False)
-  - kept_B = top_seed_ids ∪ fb_events_kept (from expand_and_metrics)
+Merge:
+  - default: intersection (selective of both)
+  - optional: union
 
-Final ids:
-  - default: verified_A ∩ kept_B
-  - optional: verified_A ∪ kept_B (use --merge-mode union)
+Cache:
+  - --cache <path> enables cache JSON
+  - After final_ids computed: cluster final_ids and store to cache.
+  - Cache match uses Jaccard over seed-cluster ids vs cached.seed_event_ids.
 
-Writes:
-  ECML-PKDD/{dataset}_retrieval/indus_explore/seed_events_{dataset}_merged_final_{merge_mode}_{fb_mode}.json
+Outputs:
+  ECML-PKDD/{dataset}_retrieval/indus_explore/seed_events_{dataset}_merged_final_{merge_mode}_{fb_mode}_cache.json
 """
 
 import sys
@@ -35,32 +36,23 @@ import argparse
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-
 # ── path setup ────────────────────────────────────────────────────────────────────
 _ecml_dir = Path(__file__).resolve().parent          # ECML-PKDD
 project_root = _ecml_dir.parent                     # repo root (Project-Ava)
 sys.path.insert(0, str(_ecml_dir))
 sys.path.insert(0, str(project_root))
 
-# INDUS helpers (Method A)
 from expand_indus_seed_events import (  # type: ignore[attr-defined]
     expand_forward_backward,
     fetch_event_data,
     _event_ids_in_vdb,
 )
 
-# Expansion-OD helpers (Method B)
 from expansion_od.expansion import (  # type: ignore[attr-defined]
     initialize_vdbs as od_initialize_vdbs,
     resolve_kg_dir as od_resolve_kg_dir,
     get_video_path,
     expand_and_metrics,
-)
-from expansion_od.clustering import (
-    events_to_id_intervals,
-    top_k_id_intervals,
-    merge_gap,
-    cluster_boundary_event_ids,
 )
 from expansion_od.gt import load_gt, load_questions
 from llms.QwenLM import QwenLM
@@ -69,12 +61,6 @@ try:
     import indus_prompts  # used only when --use-vlm
 except ImportError:
     indus_prompts = None  # type: ignore[assignment]
-
-
-# ── types ─────────────────────────────────────────────────────────────────────────
-VideoKey = str
-QuestionId = int
-QueryKey = Tuple[VideoKey, QuestionId]
 
 
 # ── JSON safety ───────────────────────────────────────────────────────────────────
@@ -109,6 +95,137 @@ def _jsonify(x):
     return str(x)
 
 
+# ── Cache helpers ─────────────────────────────────────────────────────────────────
+def load_cache(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {"version": 1, "videos": {}}
+    try:
+        obj = json.loads(path.read_text())
+        if not isinstance(obj, dict):
+            return {"version": 1, "videos": {}}
+        obj.setdefault("version", 1)
+        obj.setdefault("videos", {})
+        if not isinstance(obj["videos"], dict):
+            obj["videos"] = {}
+        return obj
+    except Exception:
+        return {"version": 1, "videos": {}}
+
+
+def save_cache(path: Path, cache: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(_jsonify(cache), indent=2, ensure_ascii=False))
+
+
+def jaccard(a: Set[str], b: Set[str]) -> float:
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    union = len(a | b)
+    return inter / union if union else 0.0
+
+
+def best_cache_match(
+    cache_video_clusters: List[Dict[str, Any]],
+    seed_cluster_ids: Set[str],
+) -> Tuple[Optional[Dict[str, Any]], float]:
+    best = None
+    best_score = 0.0
+    for c in cache_video_clusters:
+        ids = set(c.get("seed_event_ids") or [])
+        score = jaccard(seed_cluster_ids, ids)
+        if score > best_score:
+            best_score = score
+            best = c
+    return best, best_score
+
+
+# ── Time helpers / clustering by time-gap ────────────────────────────────────────
+def _event_interval(events_vdb: Any, eid: str) -> Optional[List[float]]:
+    try:
+        d = events_vdb.get_data(eid)
+    except Exception:
+        return None
+    dur = d.get("duration")
+    if isinstance(dur, (list, tuple)) and len(dur) >= 2:
+        try:
+            return [float(dur[0]), float(dur[1])]
+        except Exception:
+            return None
+    return None
+
+
+def merge_gap_intervals(intervals: List[List[float]], gap: float) -> List[List[float]]:
+    """
+    Equivalent spirit to expansion_od.clustering.merge_gap but independent:
+    intervals: [[s,e], ...]
+    Returns merged intervals list.
+    """
+    if not intervals:
+        return []
+    ivs = sorted(intervals, key=lambda x: (x[0], x[1]))
+    merged: List[List[float]] = [ivs[0][:]]
+    for s, e in ivs[1:]:
+        last = merged[-1]
+        if s <= last[1] + gap:
+            last[1] = max(last[1], e)
+        else:
+            merged.append([s, e])
+    return merged
+
+
+def cluster_ids_by_timegap(events_vdb: Any, ids: List[str], gap: float) -> List[List[str]]:
+    """
+    Cluster event ids by time-gap using their [start,end] intervals.
+    Output clusters are lists of ids (roughly ordered by start time).
+    """
+    id_iv: List[Tuple[str, List[float]]] = []
+    for eid in ids:
+        iv = _event_interval(events_vdb, eid)
+        if iv is not None:
+            id_iv.append((eid, iv))
+    if not id_iv:
+        return []
+
+    intervals = [iv for _, iv in id_iv]
+    merged = merge_gap_intervals(intervals, gap)
+
+    clusters: List[List[str]] = [[] for _ in merged]
+    for eid, iv in id_iv:
+        s, e = iv
+        for i, (ms, me) in enumerate(merged):
+            if not (e < ms or s > me):
+                clusters[i].append(eid)
+                break
+
+    # drop empties + order ids by start time
+    def _start(eid: str) -> float:
+        iv = _event_interval(events_vdb, eid)
+        return iv[0] if iv else float("inf")
+
+    out = []
+    for c in clusters:
+        if c:
+            out.append(sorted(list(dict.fromkeys(c)), key=_start))
+    return out
+
+
+def boundary_ids_global(events_vdb: Any, ids: List[str]) -> List[str]:
+    """Return [first,last] by start time (or 1 id if only one)."""
+    def _start(eid: str) -> float:
+        iv = _event_interval(events_vdb, eid)
+        return iv[0] if iv else float("inf")
+    xs = [x for x in ids if x]
+    xs = sorted(xs, key=_start)
+    if not xs:
+        return []
+    if len(xs) == 1:
+        return [xs[0]]
+    return [xs[0], xs[-1]]
+
+
 # ── Method A: Top-K Borda (None treated as +inf) ─────────────────────────────────
 def _sort_key_event(e: Dict[str, Any]) -> Tuple[int, float]:
     score = e.get("borda_score")
@@ -121,10 +238,6 @@ def _sort_key_event(e: Dict[str, Any]) -> Tuple[int, float]:
 
 
 def select_top_k_borda_seed_ids(entry: Dict[str, Any], top_k: int) -> List[str]:
-    """
-    Dedup by event id.
-    Change: borda_score == None is treated as MAX score (ranked highest).
-    """
     seed_events = entry.get("seed_events") or []
     if not seed_events or top_k <= 0:
         return []
@@ -156,7 +269,7 @@ def select_top_k_borda_seed_ids(entry: Dict[str, Any], top_k: int) -> List[str]:
     return out
 
 
-# ── VLM verification (Method A optional) ─────────────────────────────────────────
+# ── VLM for Method A ─────────────────────────────────────────────────────────────
 def _parse_query_events_from_llm(llm_output: str) -> List[str]:
     out = (llm_output or "").strip()
     if not out:
@@ -281,26 +394,22 @@ def _verify_candidates_with_vlm(
     return verified
 
 
-# ── Method A per-query ───────────────────────────────────────────────────────────
-def method_a_indus_batch1(
+def method_a_indus_batch1_using_given_topk(
     entry: Dict[str, Any],
     events_vdb: Any,
     valid_event_ids: Set[str],
-    top_k_seeds: int,
+    topk_seed_ids: List[str],
     budget: int,
     use_vlm: bool,
     llm: Any,
     verify_rule: str,
 ) -> Tuple[Set[str], Dict[str, Any]]:
     """
-    Returns:
-      verified_A_ids: Set[str]
-      trace: dict (optional diagnostics)
+    Method A but uses precomputed Top-K seeds (topk_seed_ids) to ensure both methods share same Top-K.
     """
-    trace: Dict[str, Any] = {}
-    seed_ids = select_top_k_borda_seed_ids(entry, top_k_seeds)
-    trace["seed_ids"] = list(seed_ids)
+    trace: Dict[str, Any] = {"seed_ids": list(topk_seed_ids)}
 
+    seed_ids = [x for x in topk_seed_ids if x in valid_event_ids]
     if not seed_ids:
         trace["batch1_sent"] = []
         trace["verified_A_ids"] = []
@@ -309,17 +418,13 @@ def method_a_indus_batch1(
     fb_all = expand_forward_backward(set(seed_ids), events_vdb) & valid_event_ids
     fb_candidates = fb_all - set(seed_ids)
 
-    batch1_ids = set(seed_ids) | fb_candidates
-    # deterministic ordering: seeds first, then extras sorted
-    batch1_to_send = list(seed_ids) + sorted(batch1_ids - set(seed_ids))
-
-    if len(batch1_to_send) > budget:
-        batch1_to_send = batch1_to_send[:budget]
-
-    trace["batch1_sent"] = list(batch1_to_send)
+    candidates = list(seed_ids) + sorted(list(fb_candidates))
+    if len(candidates) > budget:
+        candidates = candidates[:budget]
+    trace["batch1_sent"] = list(candidates)
 
     if not use_vlm:
-        verified = set(batch1_to_send)
+        verified = set(candidates)
         trace["verified_A_ids"] = sorted(verified)
         return verified, trace
 
@@ -329,7 +434,6 @@ def method_a_indus_batch1(
     question = entry.get("question", "")
     options = entry.get("options", "")
 
-    # Prompt 1 once per query
     prompt_p1 = indus_prompts.INDUS_PROMPT["query_event_extraction"].format(
         question=question,
         options=options or "",
@@ -342,7 +446,7 @@ def method_a_indus_batch1(
     verified = _verify_candidates_with_vlm(
         llm=llm,
         query_events=query_events,
-        candidate_ids=batch1_to_send,
+        candidate_ids=candidates,
         events_vdb=events_vdb,
         verify_rule=verify_rule,
         out_matrix=matrix_trace,
@@ -352,119 +456,186 @@ def method_a_indus_batch1(
     return verified, trace
 
 
-# ── Method B per-query ───────────────────────────────────────────────────────────
-def method_b_boundary_fb(
+# ── Method B with cache hit on clustered Top-K, but NO clustering in expansion ────
+def method_b_using_topk_with_cache(
     entry: Dict[str, Any],
     vk: str,
     qid: Any,
-    gt: Dict,
+    dataset: str,
     events_vdb: Any,
     entities_vdb: Any,
     valid_event_ids: Set[str],
+    topk_seed_ids: List[str],
     fb_mode: str,
+    gt: Dict,
     questions: Optional[Dict],
     grounding_detector: Any,
     grounding_threshold: float,
     llm_for_grounding: Optional[QwenLM],
-    expand_k: int,
-    expand_t: int,
-    dataset: str,
-) -> Tuple[Set[str], Dict[str, Any]]:
+    cache: Optional[Dict[str, Any]],
+    cache_overlap_threshold: float,
+    cache_cluster_gap: float,
+    final_cluster_gap: float,
+) -> Tuple[Set[str], Dict[str, Any], Dict[str, Any], float]:
     """
+    Steps:
+      1) cluster Top-K seeds to find cache-hit clusters
+      2) hit clusters -> reuse cached cluster_event_ids
+      3) remaining seeds -> expand_and_metrics ONCE from global boundary(first/last)
+      4) kept_B = Top-K seeds ∪ reused ∪ expanded
     Returns:
-      kept_B_ids: Set[str]
-      trace: dict
+      kept_B_ids, trace_B, cache_meta, time_fb_used (for caching final clusters)
     """
     trace: Dict[str, Any] = {}
-    events = entry.get("seed_events") or []
-    id_intervals = events_to_id_intervals(events)
-    if not id_intervals:
-        trace["reason"] = "no_id_intervals"
-        return set(), trace
+    cache_meta = {
+        "cache_enabled": bool(cache is not None),
+        "reused_clusters": 0,
+        "reused_events": 0,
+        "avg_time_reused_sec": 0.0,
+        "new_clusters_saved": 0,
+        "final_clusters_saved": 0,
+    }
+    reused_times: List[float] = []
 
-    top = top_k_id_intervals(id_intervals, expand_k, events)
-    merged = merge_gap([x[1] for x in top], expand_t)
-    boundary_ids = cluster_boundary_event_ids(top, merged)
+    seed_ids = [x for x in topk_seed_ids if x in valid_event_ids]
+    trace["topk_seed_n"] = len(seed_ids)
 
-    top_ids = set([x[0] for x in top if x and x[0]])
-    trace["top_ids"] = sorted(top_ids)
-    trace["boundary_ids"] = list(boundary_ids) if boundary_ids else []
+    if not seed_ids:
+        return set(), {"reason": "no_topk_seeds"}, cache_meta, 0.0
 
-    kept_ids: Set[str] = set()
-    kept_ids |= (top_ids & valid_event_ids)
+    # cache per video
+    cache_video_clusters: List[Dict[str, Any]] = []
+    if cache is not None:
+        videos = cache.setdefault("videos", {})
+        cache_video_clusters = videos.setdefault(str(vk), [])
+        if not isinstance(cache_video_clusters, list):
+            cache_video_clusters = []
+            videos[str(vk)] = cache_video_clusters
 
-    if not boundary_ids:
-        trace["reason"] = "no_boundary_ids"
-        return kept_ids, trace
+    # 1) cluster topK ONLY for cache hit detection
+    seed_clusters = cluster_ids_by_timegap(events_vdb, seed_ids, gap=cache_cluster_gap)
+    trace["seed_clusters_n"] = len(seed_clusters)
 
-    gt_seg = gt.get((vk, str(qid))) if gt else None
+    reused_event_ids: Set[str] = set()
+    hit_seed_ids: Set[str] = set()
 
-    fb_selective = (fb_mode == "selective")
-    video_path = get_video_path(vk, dataset) if fb_selective else None
+    for cl in seed_clusters:
+        cl_set = set(cl)
+        best, score = (None, 0.0)
+        if cache is not None and cache_video_clusters:
+            best, score = best_cache_match(cache_video_clusters, cl_set)
 
-    query_objects = []
-    if fb_selective:
-        # Grounding-based filtering needs question parsing
-        from expansion_od.grounding import extract_query_objects
-        qinfo = (questions or {}).get((vk, str(qid))) or {}
-        query_objects = extract_query_objects(
-            qinfo.get("question", ""),
-            qinfo.get("answer_statements", []),
-            llm_for_grounding,
-        ) or []
-    trace["fb_selective"] = fb_selective
-    trace["query_objects"] = query_objects if fb_selective else []
+        if best is not None and score >= cache_overlap_threshold:
+            # reuse cached cluster events
+            used = set(best.get("cluster_event_ids") or best.get("expanded_ids") or [])
+            used &= valid_event_ids
+            reused_event_ids |= used
+            hit_seed_ids |= cl_set
 
-    try:
-        _hit_fb, _time_fb, _hit_evo, _time_evo, fb_events_kept = expand_and_metrics(
-            boundary_ids,
-            gt_seg,
-            events_vdb,
-            entities_vdb,
-            run_fb=True,
-            run_evo=False,
-            fb_selective=fb_selective,
-            video_path=video_path,
-            query_objects=query_objects or None,
-            grounding_detector=grounding_detector,
-            grounding_threshold=grounding_threshold,
-            original_merged=merged,
-        )
-        if fb_events_kept:
-            kept_ids |= (set(fb_events_kept) & valid_event_ids)
-        trace["fb_events_kept_n"] = len(fb_events_kept or [])
-    except Exception as e:
-        trace["error"] = str(e)
+            cache_meta["reused_clusters"] += 1
+            cache_meta["reused_events"] += len(used)
+            t = best.get("time_sec")
+            if isinstance(t, (int, float)):
+                reused_times.append(float(t))
 
-    trace["kept_B_ids_n"] = len(kept_ids)
-    return kept_ids, trace
+    if reused_times:
+        cache_meta["avg_time_reused_sec"] = sum(reused_times) / max(1, len(reused_times))
+
+    # 2) remaining seeds expand normally (NO clustering in expansion)
+    remaining_seeds = [x for x in seed_ids if x not in hit_seed_ids]
+    trace["remaining_seeds_n"] = len(remaining_seeds)
+
+    kept_B: Set[str] = set(seed_ids) | set(reused_event_ids)
+    time_fb_used = 0.0
+
+    if remaining_seeds:
+        boundary_ids = set(remaining_seeds)
+        trace["boundary_ids"] = list(boundary_ids)
+
+        fb_selective = (fb_mode == "selective")
+        video_path = get_video_path(vk, dataset) if fb_selective else None
+
+        query_objects = []
+        if fb_selective:
+            from expansion_od.grounding import extract_query_objects
+            qinfo = (questions or {}).get((vk, str(qid))) or {}
+            query_objects = extract_query_objects(
+                qinfo.get("question", ""),
+                qinfo.get("answer_statements", []),
+                llm_for_grounding,
+            ) or []
+
+        gt_seg = gt.get((vk, str(qid))) if gt else None
+        try:
+            _hit_fb, time_fb, _hit_evo, _time_evo, fb_events_kept = expand_and_metrics(
+                boundary_ids,
+                gt_seg,
+                events_vdb,
+                entities_vdb,
+                run_fb=True,
+                run_evo=False,
+                fb_selective=fb_selective,
+                video_path=video_path,
+                query_objects=query_objects or None,
+                grounding_detector=grounding_detector,
+                grounding_threshold=grounding_threshold,
+                original_merged=None,
+            )
+            time_fb_used = float(time_fb) if isinstance(time_fb, (int, float)) else 0.0
+            kept_B |= (set(fb_events_kept or []) & valid_event_ids)
+        except Exception as e:
+            print(e)
+            trace["expand_error"] = str(e)
+
+    trace["kept_B_n_before_final_cache"] = len(kept_B)
+
+    # 3) After everything, cluster FINAL B events and save to cache
+    if cache is not None:
+        final_b_clusters = cluster_ids_by_timegap(events_vdb, sorted(kept_B), gap=final_cluster_gap)
+        cache_meta["final_clusters_saved"] = len(final_b_clusters)
+
+        for cl in final_b_clusters:
+            cl_set = set(cl)
+            # use the subset of topk seeds inside this final cluster as seed signature
+            seed_sig = sorted(list(cl_set & set(seed_ids)))
+            cache_video_clusters.append({
+                "seed_event_ids": seed_sig,                 # used for matching
+                "cluster_event_ids": sorted(list(cl_set)),  # reused directly
+                "time_sec": time_fb_used,                   # rough; from expansion call if any
+            })
+
+    return kept_B, trace, cache_meta, time_fb_used
 
 
 # ── main driver ──────────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="Merge INDUS Batch1-only with boundary FB expansion (selective-of-both).")
-    parser.add_argument("--dataset", choices=["AVA100", "LVBench"], default="AVA100")
-    parser.add_argument("--top-k-seeds", type=int, default=20)
-    parser.add_argument("--budget", type=int, required=True)
+    p = argparse.ArgumentParser(description="Merged MethodA + MethodB with cache reuse on TopK clusters + final clustering saved to cache.")
+    p.add_argument("--dataset", choices=["AVA100", "LVBench"], default="AVA100")
+    p.add_argument("--top-k-seeds", type=int, default=20)
+    p.add_argument("--budget", type=int, required=True)
 
     # Method B config
-    parser.add_argument("--fb-mode", choices=["full", "selective"], default="full")
-    parser.add_argument("--expand-k", type=int, default=20)
-    parser.add_argument("--expand-t", type=int, default=0)
-    parser.add_argument("--grounding-threshold", type=float, default=0.1)
+    p.add_argument("--fb-mode", choices=["full", "selective"], default="full")
+    p.add_argument("--grounding-threshold", type=float, default=0.1)
 
     # Merge behavior
-    parser.add_argument("--merge-mode", choices=["intersection", "union"], default="union")
+    p.add_argument("--merge-mode", choices=["intersection", "union"], default="union")
 
-    # Method A VLM config
-    parser.add_argument("--use-vlm", action="store_true")
-    parser.add_argument("--llm-port", type=int, default=8000)
-    parser.add_argument("--llm-model", type=str, default="Qwen/Qwen2.5-14B-Instruct-AWQ")
-    parser.add_argument("--verify-rule", choices=["any", "majority", "all"], default="any")
+    # VLM for Method A
+    p.add_argument("--use-vlm", action="store_true")
+    p.add_argument("--llm-port", type=int, default=8000)
+    p.add_argument("--llm-model", type=str, default="Qwen/Qwen2.5-14B-Instruct-AWQ")
+    p.add_argument("--verify-rule", choices=["any", "majority", "all"], default="any")
 
-    args = parser.parse_args()
+    # Cache
+    p.add_argument("--cache", type=str, default="", help="Cache JSON path (optional).")
+    p.add_argument("--cache-overlap-threshold", type=float, default=0.6, help="Jaccard overlap to reuse (default 0.6).")
+    p.add_argument("--cache-cluster-gap", type=float, default=0.0, help="Gap sec used to cluster TopK seeds for cache hit (default 0).")
+    p.add_argument("--final-cluster-gap", type=float, default=0.0, help="Gap sec used to cluster FINAL events before saving to cache (default 0).")
 
+    args = p.parse_args()
     dataset = args.dataset
+
     retrieval_dir = _ecml_dir / f"{dataset.lower()}_retrieval"
     seed_path = retrieval_dir / f"seed_events_{dataset}.json"
     if not seed_path.exists():
@@ -474,12 +645,21 @@ def main():
     if not isinstance(seed_data, list):
         raise ValueError(f"Expected list in {seed_path}, got {type(seed_data)}")
 
-    # Load GT/questions for Method B (expand_and_metrics signature + selective grounding)
+    # cache load
+    cache_obj: Optional[Dict[str, Any]] = None
+    cache_path: Optional[Path] = None
+    if args.cache.strip():
+        cache_path = Path(args.cache).expanduser().resolve()
+        cache_obj = load_cache(cache_path)
+        print(f"[Cache] Enabled: {cache_path}")
+    else:
+        print("[Cache] Disabled")
+
+    # GT/questions for Method B
     gt = load_gt()
     questions = None
     grounding_detector = None
     llm_for_grounding = None
-
     if args.fb_mode == "selective":
         questions = load_questions()
         from expansion_od.grounding import GroundingDetector
@@ -495,9 +675,9 @@ def main():
         vlm = init_model("qwenvl_vllm", num_gpus=1, model_type=args.llm_model, port=args.llm_port)
         print(f"VLM enabled (port={args.llm_port}, model={args.llm_model}), verify_rule={args.verify_rule}")
     else:
-        print("No-VLM mode for Method A (all sent candidates treated as verified).")
+        print("No-VLM mode for Method A.")
 
-    # Embedding model + per-video vdb cache
+    # embedding model + vdb cache per video
     from embeddings.JinaCLIP import JinaCLIP
     embedding_model = JinaCLIP("jinaai/jina-clip-v1")
 
@@ -519,7 +699,7 @@ def main():
         # init VDB per video
         if vk != current_vk:
             current_vk = vk
-            kg_dir = od_resolve_kg_dir(vk, dataset)
+            kg_dir = od_resolve_kg_dir(str(vk), dataset)
             if not kg_dir:
                 print(f"  [Warn] No KG dir for video={vk}; skip.")
                 continue
@@ -530,35 +710,42 @@ def main():
             print("  [Warn] VDB not ready; skip.")
             continue
 
-        # Method A
-        verified_A, trace_A = method_a_indus_batch1(
+        # SAME Top-K seeds for both methods
+        topk_seed_ids = select_top_k_borda_seed_ids(entry, args.top_k_seeds)
+        topk_seed_ids = [x for x in topk_seed_ids if x in valid_event_ids]
+
+        # Method A using that Top-K
+        verified_A, trace_A = method_a_indus_batch1_using_given_topk(
             entry=entry,
             events_vdb=events_vdb,
             valid_event_ids=valid_event_ids,
-            top_k_seeds=args.top_k_seeds,
+            topk_seed_ids=topk_seed_ids,
             budget=args.budget,
             use_vlm=args.use_vlm,
             llm=vlm,
             verify_rule=args.verify_rule,
         )
 
-        # Method B
-        kept_B, trace_B = method_b_boundary_fb(
+        # Method B with cache hit (cluster only for cache detection), no clustering expansion
+        kept_B, trace_B, cache_meta, _time_fb = method_b_using_topk_with_cache(
             entry=entry,
             vk=str(vk),
             qid=qid,
-            gt=gt,
+            dataset=dataset,
             events_vdb=events_vdb,
             entities_vdb=entities_vdb,
             valid_event_ids=valid_event_ids,
+            topk_seed_ids=topk_seed_ids,
             fb_mode=args.fb_mode,
+            gt=gt,
             questions=questions,
             grounding_detector=grounding_detector,
             grounding_threshold=args.grounding_threshold,
             llm_for_grounding=llm_for_grounding,
-            expand_k=args.expand_k,
-            expand_t=args.expand_t,
-            dataset=dataset,
+            cache=cache_obj,
+            cache_overlap_threshold=args.cache_overlap_threshold,
+            cache_cluster_gap=args.cache_cluster_gap,
+            final_cluster_gap=args.final_cluster_gap,
         )
 
         # Merge
@@ -569,7 +756,7 @@ def main():
 
         final_events = fetch_event_data(final_ids, events_vdb)
 
-        out_entry = {
+        out_entries.append({
             "dataset": dataset,
             "video_key": vk,
             "question_id": qid,
@@ -580,24 +767,27 @@ def main():
             "seed_events": final_events,
             "merge_meta": {
                 "merge_mode": args.merge_mode,
-                "methodA_verified_n": len(verified_A),
-                "methodB_kept_n": len(kept_B),
-                "final_n": len(final_ids),
                 "top_k_seeds": args.top_k_seeds,
                 "budget": args.budget,
                 "fb_mode": args.fb_mode,
-                "expand_k": args.expand_k,
-                "expand_t": args.expand_t,
+                "methodA_verified_n": len(verified_A),
+                "methodB_kept_n": len(kept_B),
+                "final_n": len(final_ids),
             },
-            # Keep traces for debugging (you can remove these fields if you want smaller JSON)
+            "cache_meta": cache_meta,
             "trace_methodA": trace_A,
             "trace_methodB": trace_B,
-        }
-        out_entries.append(out_entry)
+        })
 
+    # Save cache
+    if cache_obj is not None and cache_path is not None:
+        save_cache(cache_path, cache_obj)
+        print(f"[Cache] Saved: {cache_path}")
+
+    # Save final merged output
     out_dir = retrieval_dir / "indus_explore"
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"seed_events_{dataset}_merged_final_{args.merge_mode}_{args.fb_mode}.json"
+    out_path = out_dir / f"seed_events_{dataset}_merged_final_{args.merge_mode}_{args.fb_mode}_cache.json"
     out_path.write_text(json.dumps(_jsonify(out_entries), indent=2, ensure_ascii=False))
     print(f"\n✓ Saved merged output: {out_path} ({len(out_entries)} entries)")
 

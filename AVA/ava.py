@@ -171,7 +171,7 @@ class AVA:
                 continue
             storage_inst.index_done_callback()
     
-    def query_tree_search(self, query: str, question_id: int, re_process: bool = False, retrieval_mode: str = "tri_view"):
+    def query_tree_search(self, query: str, question_id: int, re_process: bool = False, retrieval_mode: str = "tri_view", initial_events_result: list = None):
         # Start timing for query tree search
         query_tree_search_start = time.time()
         logger.info(f"STEP - Query Tree Search Start for question {question_id}")
@@ -187,8 +187,16 @@ class AVA:
             os.makedirs(question_folder)
         folder_setup_end = time.time()
         logger.info(f"TIMING - Folder Setup ({retrieval_mode}): {folder_setup_end - folder_setup_start:.4f} seconds")
-            
+        
+
+        if os.path.exists(os.path.join(question_folder, "tree_information.json")):
+            with open(os.path.join(question_folder, "tree_information.json"), "r") as f:
+                tree_information = json.load(f)
+            if tree_information == []:
+                re_process = True
+
         if not re_process and os.path.exists(os.path.join(question_folder, "tree_information.json")):
+            print(f"Tree information already exists for question {question_id}, skipping...")
             logger.info(f"Tree information already exists for question {question_id}, skipping...")
             logger.info(f"TIMING - Query Tree Search (cached): {time.time() - query_tree_search_start:.4f} seconds")
             return
@@ -197,7 +205,7 @@ class AVA:
             
             # Tree search execution with specific retrieval mode
             tree_search_execution_start = time.time()
-            tree_information = tree_search(query, self.llm_model, self.video, self.events_vdb, self.entities_vdb, self.features_vdb, retrieval_mode=retrieval_mode)
+            tree_information = tree_search(query, self.llm_model, self.video, self.events_vdb, self.entities_vdb, self.features_vdb, retrieval_mode=retrieval_mode, initial_events_result=initial_events_result)
             tree_search_execution_end = time.time()
             logger.info(f"TIMING - Tree Search Execution ({retrieval_mode}): {tree_search_execution_end - tree_search_execution_start:.4f} seconds")
             

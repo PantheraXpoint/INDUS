@@ -2,25 +2,28 @@
 """
 Calculate retrieval accuracy from ECML-PKDD seed_events JSON.
 
-All times are in SECONDS (video timeline):
-- Event duration in the database (seed_events) is already in seconds.
-- time_reference in datas (AVA100, LVBench) is converted to seconds from
-  "HH:MM:SS" or "MM:SS" format.
+Adds new metrics:
+- Precision (evt), IoU (evt), SNR (evt)
+- Precision (sec), IoU (sec), SNR (sec)
 
-Time reference formats supported:
-- Single point: "00:1:20", "01:16:50", "4:19"
-- Time range:   "00:15-00:19", "04:19-08:41" (start-end in same format)
-- Multiple points: "00:1:20,00:24:46,00:47:40" (comma-separated; binary = any hit, percentage = average coverage)
+Definitions (your requested choices):
+- For a POINT GT time t: if t is inside ANY retrieved event interval => it is a FULL HIT (coverage=1.0).
+  For sec-metrics, we treat point GT as a 1-second window [t, t+1) to define lengths.
+- FN for event-IoU uses SEGMENT-level GT:
+    * time range => 1 segment
+    * multiple points => each point is a segment
+    * single point => 1 segment
+- IoU(evt) = TP_seg / (TP_seg + FN_seg + FP_evt)
+- Precision(evt) = TP_evt / (TP_evt + FP_evt)
+- SNR(evt) = TP_evt / FP_evt (inf if FP_evt=0 and TP_evt>0; 0 if both 0)
 
-Ground truth from:
-- AVA100: datas/AVA100/{citytour,ego,traffic,wildlife}.json
-- LVBench: datas/LVBench/LVBench.json
-
-Metrics:
-- Binary overlap: fraction of queries with valid time GT where at least one
-  retrieved event's duration overlaps the GT time point/range.
-- Percentage overlap: (sum of per-query overlap percentages) / (number of queries
-  with valid time GT).
+- Sec-level metrics:
+    R = union length of retrieved intervals (seconds)
+    G = union length of GT intervals (seconds; for points uses 1-sec windows)
+    I = intersection length between retrieved union and GT union
+    Precision(sec) = I / R
+    IoU(sec)       = I / (R + G - I)
+    SNR(sec)       = I / (R - I)   (inf if R==I and I>0; 0 if I==0)
 """
 
 import json
@@ -30,16 +33,10 @@ from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any
 
 # -----------------------------------------------------------------------------
-# Time parsing and overlap (aligned with ICDCS/calc_acc_new.py logic)
+# Time parsing and overlap (aligned with your existing logic)
 # -----------------------------------------------------------------------------
 
 def time_to_seconds(time_str: str) -> int:
-    """
-    Parse a single time string to integer seconds.
-    - HH:MM:SS or H:MM:SS or HH:M:SS etc. (2 or 3 colons) -> hours*3600 + minutes*60 + seconds
-    - MM:SS or M:SS (one colon) -> minutes*60 + seconds
-    Handles optional leading zeros and spaces.
-    """
     time_str = (time_str or "").strip()
     if not time_str:
         raise ValueError("Empty time string")
@@ -48,16 +45,13 @@ def time_to_seconds(time_str: str) -> int:
     if not parts:
         raise ValueError(f"Invalid time string: {time_str}")
     if len(parts) == 2:
-        # MM:SS
         return int(parts[0]) * 60 + int(parts[1])
     if len(parts) >= 3:
-        # HH:MM:SS (only first three components)
         return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
     return int(parts[0])
 
 
 def is_valid_time_reference(time_ref: str) -> bool:
-    """True if time_ref can be used for accuracy (not N/A, not malformed)."""
     if not time_ref or time_ref.strip() in ["N/A", "", "None", "None-None"]:
         return False
     time_ref = time_ref.strip()
@@ -88,7 +82,6 @@ def is_valid_time_reference(time_ref: str) -> bool:
 def _percentage_overlap_single(
     time_list: List[Tuple[int, int]], ref_start: int, ref_end: int
 ) -> float:
-    """Fraction of [ref_start, ref_end] covered by time_list. 0 if ref_end < ref_start."""
     if ref_end < ref_start:
         return 0.0
     if ref_start == ref_end:
@@ -122,10 +115,7 @@ def _percentage_overlap_single(
     return min(1.0, total_covered / ref_length) if ref_length > 0 else 0.0
 
 
-def has_any_overlap(
-    time_list: List[Tuple[int, int]], time_ref: Tuple[int, int]
-) -> bool:
-    """True if any interval in time_list overlaps [ref_start, ref_end]."""
+def has_any_overlap(time_list: List[Tuple[int, int]], time_ref: Tuple[int, int]) -> bool:
     ref_start, ref_end = time_ref
     if ref_end < ref_start:
         return False
@@ -145,20 +135,11 @@ def has_any_overlap(
     return False
 
 
-def overlap_reference_helper(
-    time_ref: str, time_list: List[Tuple[int, int]]
-) -> Optional[float]:
-    """
-    Return fraction of time_ref covered by time_list (0.0..1.0), in seconds.
-    Supports: single point (HH:MM:SS), time range (start-end), multiple points (t1,t2,...).
-    For multiple points, returns the average coverage of each point.
-    Returns None if time_ref is invalid.
-    """
+def overlap_reference_helper(time_ref: str, time_list: List[Tuple[int, int]]) -> Optional[float]:
     if not time_ref or time_ref.strip() in ["N/A", "", "None", "None-None"]:
         return None
     time_ref = time_ref.strip()
     try:
-        # Time range: "start-end" (e.g. "00:15-00:19", "04:19-08:41")
         if "-" in time_ref:
             start_s, end_s = time_ref.split("-", 1)
             start_s = start_s.strip() or end_s.strip()
@@ -168,7 +149,6 @@ def overlap_reference_helper(
             s_sec = time_to_seconds(start_s)
             e_sec = time_to_seconds(end_s)
             return _percentage_overlap_single(time_list, s_sec, e_sec)
-        # Multiple time points: "t1,t2,t3" (e.g. "00:1:20,01:16:50")
         if "," in time_ref:
             points = [p.strip() for p in time_ref.split(",") if p.strip()]
             if not points:
@@ -178,26 +158,17 @@ def overlap_reference_helper(
                 t = time_to_seconds(p)
                 pcts.append(_percentage_overlap_single(time_list, t, t))
             return sum(pcts) / len(pcts)
-        # Single time point: "00:1:20" or "01:16:50"
         t = time_to_seconds(time_ref)
         return _percentage_overlap_single(time_list, t, t)
     except (ValueError, IndexError):
         return None
 
 
-def binary_overlap_helper(
-    time_ref: str, time_list: List[Tuple[int, int]]
-) -> Optional[float]:
-    """
-    1.0 if any overlap, 0.0 if no overlap, None if invalid time_ref.
-    Supports: single point, time range (start-end), multiple points (any point hitting = 1.0).
-    All times converted to seconds (HH:MM:SS / MM:SS).
-    """
+def binary_overlap_helper(time_ref: str, time_list: List[Tuple[int, int]]) -> Optional[float]:
     if not time_ref or time_ref.strip() in ["N/A", "", "None", "None-None"]:
         return None
     time_ref = time_ref.strip()
     try:
-        # Time range
         if "-" in time_ref:
             start_s, end_s = time_ref.split("-", 1)
             start_s = start_s.strip() or end_s.strip()
@@ -207,7 +178,6 @@ def binary_overlap_helper(
             s_sec = time_to_seconds(start_s)
             e_sec = time_to_seconds(end_s)
             return 1.0 if has_any_overlap(time_list, (s_sec, e_sec)) else 0.0
-        # Multiple points: hit if any point overlaps
         if "," in time_ref:
             for p in time_ref.split(","):
                 p = p.strip()
@@ -217,7 +187,6 @@ def binary_overlap_helper(
                 if has_any_overlap(time_list, (t, t)):
                     return 1.0
             return 0.0
-        # Single point
         t = time_to_seconds(time_ref)
         return 1.0 if has_any_overlap(time_list, (t, t)) else 0.0
     except (ValueError, IndexError):
@@ -225,14 +194,62 @@ def binary_overlap_helper(
 
 
 # -----------------------------------------------------------------------------
+# NEW: interval union + intersection (seconds)
+# -----------------------------------------------------------------------------
+
+def _normalize_intervals(intervals: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    out = []
+    for s, e in intervals:
+        if e <= s:
+            continue
+        out.append((int(s), int(e)))
+    out.sort()
+    return out
+
+
+def union_intervals(intervals: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    ivs = _normalize_intervals(intervals)
+    if not ivs:
+        return []
+    merged = [ivs[0]]
+    for s, e in ivs[1:]:
+        ls, le = merged[-1]
+        if s <= le:
+            merged[-1] = (ls, max(le, e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
+def union_length(intervals: List[Tuple[int, int]]) -> float:
+    u = union_intervals(intervals)
+    return float(sum(e - s for s, e in u))
+
+
+def intersection_length(a: List[Tuple[int, int]], b: List[Tuple[int, int]]) -> float:
+    A = union_intervals(a)
+    B = union_intervals(b)
+    i = j = 0
+    total = 0.0
+    while i < len(A) and j < len(B):
+        a0, a1 = A[i]
+        b0, b1 = B[j]
+        s = max(a0, b0)
+        e = min(a1, b1)
+        if e > s:
+            total += (e - s)
+        if a1 <= b1:
+            i += 1
+        else:
+            j += 1
+    return float(total)
+
+
+# -----------------------------------------------------------------------------
 # Ground truth loading
 # -----------------------------------------------------------------------------
 
 def load_ground_truth_cache(dataset: str, project_root: Path) -> Dict[Tuple[str, str], str]:
-    """
-    (video_key, question_id) -> time_reference.
-    question_id is string for consistent lookup.
-    """
     cache: Dict[Tuple[str, str], str] = {}
     if dataset == "AVA100":
         base = project_root / "datas" / "AVA100"
@@ -250,9 +267,7 @@ def load_ground_truth_cache(dataset: str, project_root: Path) -> Dict[Tuple[str,
                         for qa in video.get("qa", []):
                             qid = qa.get("question_id")
                             if qid is not None:
-                                cache[(video_key, str(qid))] = qa.get(
-                                    "time_reference", "N/A"
-                                )
+                                cache[(video_key, str(qid))] = qa.get("time_reference", "N/A")
             except Exception as e:
                 print(f"  Warning: failed to load {path}: {e}")
     elif dataset == "LVBench":
@@ -268,33 +283,18 @@ def load_ground_truth_cache(dataset: str, project_root: Path) -> Dict[Tuple[str,
                         for qa in video.get("qa", []):
                             uid = qa.get("uid") or qa.get("question_id")
                             if uid is not None:
-                                cache[(video_key, str(uid))] = qa.get(
-                                    "time_reference", "N/A"
-                                )
+                                cache[(video_key, str(uid))] = qa.get("time_reference", "N/A")
             except Exception as e:
                 print(f"  Warning: failed to load {path}: {e}")
     return cache
 
 
 # -----------------------------------------------------------------------------
-# Seed events loading (durations already in seconds)
+# Seed events loading
 # -----------------------------------------------------------------------------
 
-def event_durations_to_seconds(
-    seed_events: List[Dict],
-    dataset: str,
-    video_key: str,
-) -> List[Dict[str, Any]]:
-    """
-    Build per-event intervals (in seconds) from seed_events.
-
-    The database stores event duration in SECONDS (video timeline). We use values
-    as-is so that overlap is computed in the same unit as time_reference (which
-    is converted from HH:MM:SS / MM:SS to seconds).
-
-    Returns:
-        List of {"id": <event_id or None>, "interval_sec": [start_sec, end_sec]}
-    """
+def event_durations_to_seconds(seed_events: List[Dict], dataset: str, video_key: str) -> List[Dict[str, Any]]:
+    events_ids: set[str] = set()
     events_sec: List[Dict[str, Any]] = []
     for ev in seed_events:
         dur = ev.get("duration")
@@ -308,17 +308,17 @@ def event_durations_to_seconds(
         if b_sec <= a_sec:
             b_sec = a_sec + 1
         ev_id = ev.get("id") or ev.get("__id__")
+        if ev_id in events_ids:
+            continue
+        events_ids.add(ev_id)
         events_sec.append({"id": ev_id, "interval_sec": [a_sec, b_sec]})
     return events_sec
 
 
-def time_reference_to_segments_sec(time_ref: str) -> Optional[List[Tuple[int, int]]]:
+def gt_to_segments_sec(time_ref: str) -> Optional[List[Tuple[int, int]]]:
     """
-    Convert time_reference string to list of GT segments in seconds.
-    - "start-end" -> [(start_sec, end_sec)]
-    - "t1,t2,..." -> [(t1,t1), (t2,t2), ...]
-    - "t"         -> [(t,t)]
-    Returns None if invalid / N/A.
+    Convert time_reference to GT segments in seconds.
+    For points, return a 1-second window [t, t+1) for sec-level metrics + segment hit counting.
     """
     if not time_ref or time_ref.strip() in ["N/A", "", "None", "None-None"]:
         return None
@@ -332,37 +332,49 @@ def time_reference_to_segments_sec(time_ref: str) -> Optional[List[Tuple[int, in
                 return None
             s_sec = time_to_seconds(start_s)
             e_sec = time_to_seconds(end_s)
+            if e_sec < s_sec:
+                return None
             return [(s_sec, e_sec)]
         if "," in time_ref:
             points = [p.strip() for p in time_ref.split(",") if p.strip()]
             if not points:
                 return None
-            return [(time_to_seconds(p), time_to_seconds(p)) for p in points]
+            out = []
+            for p in points:
+                t = time_to_seconds(p)
+                out.append((t, t + 1))
+            return out
         t = time_to_seconds(time_ref)
-        return [(t, t)]
+        return [(t, t + 1)]
     except (ValueError, IndexError):
         return None
 
 
-def event_hits_gt(interval: Tuple[int, int], gt_segments: List[Tuple[int, int]]) -> bool:
+def event_hits_any_gt_segment(interval: Tuple[int, int], gt_segments: List[Tuple[int, int]]) -> bool:
     """
-    Check if an event interval (start_sec, end_sec) hits any GT segment.
-    - For point GT segments (s==e): hit if start <= s < end.
-    - For range GT segments: hit if intervals overlap.
+    interval hits any GT segment (segments are ranges; for point GT they are 1-sec windows).
     """
     s, e = interval
     if e <= s:
         return False
     for gs, ge in gt_segments:
-        if ge < gs:
+        if ge <= gs:
             continue
-        if gs == ge:
-            # point segment
-            if s <= gs < e:
-                return True
-        else:
-            if max(s, gs) < min(e, ge):
-                return True
+        if max(s, gs) < min(e, ge):
+            return True
+    return False
+
+
+def gt_segment_hit_by_retrieval(gt_seg: Tuple[int, int], retrieved_intervals: List[Tuple[int, int]]) -> bool:
+    """
+    Segment-level hit: whether any retrieved interval overlaps GT segment.
+    """
+    gs, ge = gt_seg
+    for s, e in retrieved_intervals:
+        if e <= s:
+            continue
+        if max(s, gs) < min(e, ge):
+            return True
     return False
 
 
@@ -370,38 +382,45 @@ def event_hits_gt(interval: Tuple[int, int], gt_segments: List[Tuple[int, int]])
 # Main accuracy computation
 # -----------------------------------------------------------------------------
 
-def run_accuracy(
-    seed_events_path: Path,
-    dataset: str,
-    project_root: Path,
-    output_path: Optional[Path] = None,
-) -> Dict[str, Any]:
-    """
-    Compute binary and percentage overlap accuracy.
-    All times in seconds: event duration from DB, time_reference converted from HH:MM:SS/MM:SS.
-
-    - Binary: (number of queries with valid time GT that have at least one hit) / (number of queries with valid time GT).
-      For multiple time points in one query: hitting ANY one point counts as binary hit.
-    - Percentage: For a query with multiple time points, first average the coverage over each point; then
-      (sum of these per-query percentages) / (number of queries with valid time GT).
-    - Per-query total_event_duration_sec = sum of (end - start) over all event intervals.
-    - avg_total_event_duration_sec and avg_num_events are over ALL queries (all entries with video_key/question_id), not just valid time GT.
-    """
-    if not seed_events_path.exists():
-        raise FileNotFoundError(f"Seed events file not found: {seed_events_path}")
-    data = json.loads(seed_events_path.read_text())
-    if not isinstance(data, list):
-        raise ValueError("Expected seed_events JSON to be a list of entries")
+def run_accuracy(seed_events_path, dataset: str, project_root: Path, output_path: Optional[Path] = None) -> Dict[str, Any]:
+    data = []
+    if isinstance(seed_events_path, Path):
+        if not seed_events_path.exists():
+            raise FileNotFoundError(f"Seed events file not found: {seed_events_path}")
+        data = json.loads(seed_events_path.read_text())
+    elif isinstance(seed_events_path, list):
+        for entry in seed_events_path:
+            data_entries = json.loads(entry.read_text())
+            for idx, data_entry in enumerate(data_entries):
+                if (
+                    len(data) > idx
+                    and data[idx].get("video_key") == data_entry.get("video_key")
+                    and data[idx].get("question_id") == data_entry.get("question_id")
+                ):
+                    data[idx]["seed_events"].extend(data_entry.get("seed_events", []))
+                else:
+                    data.append(data_entry)
+    else:
+        raise ValueError(f"Expected seed_events path to be a Path or list: {seed_events_path}")
 
     gt_cache = load_ground_truth_cache(dataset, project_root)
 
-    # All-queries stats (for avg total event duration and avg num_events over all queries)
+    # all queries stats (avg duration, avg #events)
     n_total = 0
     total_duration_sum_all = 0.0
     num_events_sum_all = 0
 
-    valid_entries = []
     per_query = []
+    n_valid = 0
+
+    # aggregate sums over VALID GT queries
+    sum_precision_evt = 0.0
+    sum_iou_evt = 0.0
+    sum_snr_evt = 0.0
+
+    sum_precision_sec = 0.0
+    sum_iou_sec = 0.0
+    sum_snr_sec = 0.0
 
     for entry in data:
         video_key = entry.get("video_key")
@@ -412,6 +431,7 @@ def run_accuracy(
         seed_events = entry.get("seed_events") or []
         events_sec = event_durations_to_seconds(seed_events, dataset, video_key)
         intervals = [tuple(ev["interval_sec"]) for ev in events_sec]
+
         total_duration_sec = sum(e - s for s, e in intervals)
         num_events = len(intervals)
         n_total += 1
@@ -420,26 +440,64 @@ def run_accuracy(
 
         key = (video_key, str(question_id))
         time_ref = gt_cache.get(key)
-        if time_ref is None:
-            continue
-        if not is_valid_time_reference(time_ref):
+        if time_ref is None or not is_valid_time_reference(time_ref):
             continue
 
         binary = binary_overlap_helper(time_ref, intervals)
         percentage = overlap_reference_helper(time_ref, intervals)
-
         if binary is None:
             continue
-        valid_entries.append(entry)
-        gt_segments = time_reference_to_segments_sec(time_ref)
-        events_hit = []
-        if gt_segments:
-            events_hit = [
-                ev for ev in events_sec if event_hits_gt(tuple(ev["interval_sec"]), gt_segments)
-            ]
-        # For percentage, use 0.0 when no overlap (so denominator is all valid)
+
+        gt_segments = gt_to_segments_sec(time_ref)
+        if not gt_segments:
+            continue
+
+        n_valid += 1
+
+        # ----------------------------
+        # Event-level metrics
+        # ----------------------------
+        tp_evt = 0
+        fp_evt = 0
+        for ev in events_sec:
+            s, e = ev["interval_sec"]
+            if event_hits_any_gt_segment((s, e), gt_segments):
+                tp_evt += 1
+            else:
+                fp_evt += 1
+
+        precision_evt = (tp_evt / (tp_evt + fp_evt)) if (tp_evt + fp_evt) > 0 else 0.0
+        snr_evt = float("inf") if (fp_evt == 0 and tp_evt > 0) else (tp_evt / fp_evt if fp_evt > 0 else 0.0)
+
+        # segment-level TP/FN for IoU(evt)
+        tp_seg = 0
+        fn_seg = 0
+        for seg in gt_segments:
+            if gt_segment_hit_by_retrieval(seg, intervals):
+                tp_seg += 1
+            else:
+                fn_seg += 1
+        denom_evt_iou = tp_seg + fn_seg + fp_evt
+        iou_evt = (tp_seg / denom_evt_iou) if denom_evt_iou > 0 else 0.0
+
+        # ----------------------------
+        # Sec-level metrics
+        # ----------------------------
+        R = union_length(intervals)
+        G = union_length(gt_segments)
+        I = intersection_length(intervals, gt_segments)
+        U = (R + G - I)
+
+        precision_sec = (I / R) if R > 0 else 0.0
+        iou_sec = (I / U) if U > 0 else 0.0
+        noise = (R - I)
+        snr_sec = float("inf") if (noise == 0 and I > 0) else (I / noise if noise > 0 else 0.0)
+
+        # store per-query hit list (events that hit any GT segment)
+        events_hit = [ev for ev in events_sec if event_hits_any_gt_segment(tuple(ev["interval_sec"]), gt_segments)]
+
         pct_val = percentage if percentage is not None else 0.0
-        first_interval = intervals[0] if intervals else None
+
         per_query.append({
             "video_key": video_key,
             "question_id": question_id,
@@ -449,97 +507,119 @@ def run_accuracy(
             "percentage_overlap": pct_val,
             "num_events": len(intervals),
             "total_event_duration_sec": total_duration_sec,
-            "first_event_interval_sec": first_interval,
             "events_hit": events_hit,
+
+            # event-level
+            "tp_evt": tp_evt,
+            "fp_evt": fp_evt,
+            "tp_seg": tp_seg,
+            "fn_seg": fn_seg,
+            "precision_evt": precision_evt,
+            "iou_evt": iou_evt,
+            "snr_evt": snr_evt,
+
+            # sec-level
+            "retrieved_sec_union": R,
+            "gt_sec_union": G,
+            "intersection_sec": I,
+            "precision_sec": precision_sec,
+            "iou_sec": iou_sec,
+            "snr_sec": snr_sec,
         })
 
-    n_valid = len(valid_entries)
-    if n_valid > 0 and per_query:
-        p0 = per_query[0]
-        try:
-            tr = p0["time_reference"].strip()
-            gt_sec = time_to_seconds(tr.split("-")[0].strip() if "-" in tr else tr)
-        except Exception:
-            gt_sec = None
-        print(f"  [Unit check] First query: time_reference='{p0['time_reference']}' -> {gt_sec} sec; first event interval (sec)={p0.get('first_event_interval_sec')}")
+        sum_precision_evt += precision_evt
+        sum_iou_evt += iou_evt
+        # average SNR: treat inf as a large cap? We'll keep numeric sum ignoring inf, and separately count inf.
+        # For simplicity: if inf, don't add to sum and count separately.
+        if snr_evt != float("inf"):
+            sum_snr_evt += snr_evt
+
+        sum_precision_sec += precision_sec
+        sum_iou_sec += iou_sec
+        if snr_sec != float("inf"):
+            sum_snr_sec += snr_sec
+
     if n_valid == 0:
-        return {
+        result = {
             "dataset": dataset,
             "seed_events_file": str(seed_events_path),
             "num_queries_total": n_total,
             "num_queries_with_valid_time_gt": 0,
-            "binary_overlap_accuracy": None,
-            "percentage_overlap_accuracy": None,
+            "hit_rate": None,
+            "coverage_rate": None,
             "avg_total_event_duration_sec": total_duration_sum_all / n_total if n_total else None,
             "avg_num_events": num_events_sum_all / n_total if n_total else None,
             "per_query": [],
         }
+        if output_path:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(json.dumps(result, indent=2))
+        return result
 
+    # Existing (hit/coverage)
     binary_sum = sum(p["binary_overlap"] for p in per_query)
     percentage_sum = sum(p["percentage_overlap"] for p in per_query)
+
+    # Average SNR: also report how many were inf (optional)
+    inf_snr_evt = sum(1 for p in per_query if p["snr_evt"] == float("inf"))
+    inf_snr_sec = sum(1 for p in per_query if p["snr_sec"] == float("inf"))
+    finite_n_evt = n_valid - inf_snr_evt
+    finite_n_sec = n_valid - inf_snr_sec
 
     result = {
         "dataset": dataset,
         "seed_events_file": str(seed_events_path),
         "num_queries_total": n_total,
         "num_queries_with_valid_time_gt": n_valid,
-        "binary_overlap_accuracy": binary_sum / n_valid,
-        "percentage_overlap_accuracy": percentage_sum / n_valid,
+
+        # requested headline metrics
+        "hit_rate": binary_sum / n_valid,
+        "coverage_rate": percentage_sum / n_valid,
+
+        "precision_evt": sum_precision_evt / n_valid,
+        "iou_evt": sum_iou_evt / n_valid,
+        "snr_evt_avg_finite": (sum_snr_evt / finite_n_evt) if finite_n_evt > 0 else None,
+        "snr_evt_inf_count": inf_snr_evt,
+
+        "precision_sec": sum_precision_sec / n_valid,
+        "iou_sec": sum_iou_sec / n_valid,
+        "snr_sec_avg_finite": (sum_snr_sec / finite_n_sec) if finite_n_sec > 0 else None,
+        "snr_sec_inf_count": inf_snr_sec,
+
+        # existing totals
         "binary_hits": int(binary_sum),
         "percentage_sum": percentage_sum,
         "avg_total_event_duration_sec": total_duration_sum_all / n_total if n_total else None,
         "avg_num_events": num_events_sum_all / n_total if n_total else None,
+
         "per_query": per_query,
     }
+
     if output_path:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(json.dumps(result, indent=2))
+
     return result
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Calculate retrieval accuracy from ECML-PKDD seed_events JSON."
-    )
-    parser.add_argument(
-        "--dataset",
-        type=str,
-        choices=["AVA100", "LVBench"],
-        required=True,
-        help="Dataset name",
-    )
-    parser.add_argument(
-        "--seed-events",
-        type=Path,
-        default=None,
-        help="Path to seed_events_{dataset}.json (default: ECML-PKDD/indus_outputs/seed_events_{dataset}.json)",
-    )
-    parser.add_argument(
-        "--project-root",
-        type=Path,
-        default=None,
-        help="Project root (default: parent of ECML-PKDD)",
-    )
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=None,
-        help="Write full result JSON here",
-    )
+    parser = argparse.ArgumentParser(description="Calculate retrieval accuracy from ECML-PKDD seed_events JSON.")
+    parser.add_argument("--dataset", type=str, choices=["AVA100", "LVBench"], required=True)
+    parser.add_argument("--seed-events", type=Path, default=None)
+    parser.add_argument("--project-root", type=Path, default=None)
+    parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args()
 
     project_root = args.project_root or (Path(__file__).resolve().parent.parent)
     script_dir = Path(__file__).resolve().parent
-    seed_events_path = args.seed_events or (
-        script_dir / "indus_outputs" / f"seed_events_{args.dataset}.json"
-    )
+    seed_events_path = args.seed_events or (script_dir / "indus_outputs" / f"seed_events_{args.dataset}.json")
 
     print(f"Dataset: {args.dataset}")
     print(f"Seed events: {seed_events_path}")
     print(f"Project root: {project_root}")
 
     result = run_accuracy(
-        seed_events_path=seed_events_path,
+        seed_events_path=[seed_events_path],
         dataset=args.dataset,
         project_root=project_root,
         output_path=args.output,
@@ -548,14 +628,24 @@ def main():
     n_valid = result["num_queries_with_valid_time_gt"]
     n_total = result.get("num_queries_total", n_valid)
     print(f"\nQueries (total): {n_total}; with valid time GT: {n_valid}")
+
     if n_valid > 0:
-        print(f"Binary overlap accuracy:    {result['binary_overlap_accuracy']:.4f}  ({result['binary_hits']}/{n_valid})")
-        print(f"Percentage overlap (avg):  {result['percentage_overlap_accuracy']:.4f}  (sum={result['percentage_sum']:.4f} / {n_valid})")
+        print(f"Hit rate:        {result['hit_rate']:.4f}  ({result['binary_hits']}/{n_valid})")
+        print(f"Coverage rate:   {result['coverage_rate']:.4f}")
+
+        print("\nEvent-level:")
+        print(f"  Precision(evt): {result['precision_evt']:.4f}")
+        print(f"  IoU(evt):       {result['iou_evt']:.4f}")
+        print(f"  SNR(evt):       {result['snr_evt_avg_finite']:.4f} (finite avg), inf_count={result['snr_evt_inf_count']}")
+
+        print("\nSecond-level:")
+        print(f"  Precision(sec): {result['precision_sec']:.4f}")
+        print(f"  IoU(sec):       {result['iou_sec']:.4f}")
+        print(f"  SNR(sec):       {result['snr_sec_avg_finite']:.4f} (finite avg), inf_count={result['snr_sec_inf_count']}")
+
     if n_total > 0 and result.get("avg_total_event_duration_sec") is not None:
-        print(f"Avg total event duration:   {result['avg_total_event_duration_sec']:.2f} sec per query  (over all {n_total} queries)")
-        print(f"Avg num events per query:   {result['avg_num_events']:.2f}  (over all {n_total} queries)")
-    if n_valid == 0:
-        print("No queries with valid time reference; no overlap metrics.")
+        print(f"\nAvg total event duration: {result['avg_total_event_duration_sec']:.2f} sec per query (over all {n_total} queries)")
+        print(f"Avg num events per query: {result['avg_num_events']:.2f} (over all {n_total} queries)")
 
     if args.output:
         print(f"\nWrote full result to {args.output}")

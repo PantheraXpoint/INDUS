@@ -141,6 +141,17 @@ def tri_view_retrieval(
     
     return results
 
+def pesou_triview_retrieval(
+    query: str,
+    events_vdb: BaseVectorStorage,
+    initial_events_result: List[Dict],
+):
+    new_initial_events_result = []
+    for event_id in initial_events_result:
+        event_data = events_vdb.get_data(event_id)
+        new_initial_events_result.append({"event_id": [event_id],"query": [query], "event_data": [event_data], "score": 1.0, "generation": 1})
+    return new_initial_events_result
+
 def events_only_retrieval(
     query: str,
     llm: Union[BaseLanguageModel, BaseVideoModel],
@@ -726,7 +737,8 @@ class TreeSearch:
                  entities_vdb: BaseVectorStorage,
                  features_vdb: BaseVectorStorage,
                  max_depth: int = 3,
-                 retrieval_mode: str = "tri_view"):
+                 retrieval_mode: str = "tri_view",
+                 initial_events_result: List[Dict] = None):
         self.query = query
         self.llm = llm
         self.video = video
@@ -735,6 +747,7 @@ class TreeSearch:
         self.features_vdb = features_vdb
         self.max_depth = max_depth
         self.retrieval_mode = retrieval_mode
+        self.initial_events_result = initial_events_result
         self.event_list = self.init_event_list(query, llm, events_vdb, entities_vdb, features_vdb, retrieval_mode)
         self.root = Node(state={}, action="Root", query=query, initial_event_list=self.event_list, events_vdb=events_vdb, entities_vdb=entities_vdb, features_vdb=features_vdb, llm=llm, video=video)
         
@@ -753,7 +766,8 @@ class TreeSearch:
             events_result = features_only_retrieval(query, llm, features_vdb, events_vdb)
         else:
             # Default to tri_view
-            events_result = tri_view_retrieval(query, llm, events_vdb, entities_vdb, features_vdb)
+            pass
+        events_result = pesou_triview_retrieval(query, events_vdb, self.initial_events_result)
             
         event_list = EventList(events_result)
         init_end = time.time()

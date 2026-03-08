@@ -11,11 +11,16 @@ class VideoRepresentation:
         self.frames_dir = os.path.join(work_dir, "frames")
         if not os.path.exists(self.frames_dir):
             os.makedirs(self.frames_dir)
+            self.extract_frames()
         
         if not os.path.exists(os.path.join(work_dir, "config.json")):
             self.extract_frames()
         else:
             self.config = json.load(open(os.path.join(work_dir, "config.json")))
+            try:
+                self.config["fps"] = int(self.config["fps"])
+            except:
+                self.extract_frames()
     
     def extract_frames(self):
         config = read_video_frames(self.video_source_path, self.frames_dir)
@@ -180,3 +185,13 @@ def read_video_frames(video_path, save_path, target_fps=0, target_resolution=(54
     }
 
     return config
+
+if __name__ == "__main__":
+    video_folder = "datas/AVA100/videos/"
+    work_folder = "AVA_cache/AVA100/"
+    for video_file in os.listdir(video_folder):
+        video_path = os.path.join(video_folder, video_file)
+        video_id = video_file.split(".")[0]
+        print(f"Processing video {video_id}")
+        work_path = os.path.join(work_folder, video_id)
+        VideoRepresentation(video_path, work_path)

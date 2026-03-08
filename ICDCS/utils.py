@@ -3,6 +3,9 @@ import json
 import time
 from llms.BaseModel import BaseVideoModel
 from bert_score import score, BERTScorer
+import json
+import ast
+from typing import Optional
 
 def semantic_chunking(
     llm: BaseVideoModel,
@@ -114,3 +117,50 @@ def semantic_chunking(
     
     events = format_events(events)
     return events, profiling
+
+def extract_analysis_value(raw: str) -> str:
+    """
+    Extracts obj["Analysis"] from inputs like:
+      '{\\n  "Analysis": "The user\\'s ..."}'
+    or:
+      '{ "Analysis": "..." }'
+    """
+    s = raw.strip()
+
+    # 1) Try normal JSON first
+    try:
+        obj = json.loads(s)
+        # If it's a JSON string containing JSON, decode again
+        if isinstance(obj, str):
+            obj = json.loads(obj)
+        if isinstance(obj, dict) and "Analysis" in obj:
+            return obj["Analysis"]
+    except json.JSONDecodeError:
+        pass
+
+    # 2) If it's wrapped in Python quotes (like your example), decode as Python string literal
+    #    This converts \\n -> newline and \\' -> '
+    try:
+        decoded = ast.literal_eval(s)  # important: DO NOT strip outer quotes first
+        if isinstance(decoded, dict) and "Analysis" in decoded:
+            return decoded["Analysis"]
+
+        if isinstance(decoded, str):
+            # decoded is now the inner JSON text
+            obj = json.loads(decoded)
+            return obj["Analysis"]
+    except Exception:
+        pass
+
+    # 3) Last resort: fix the common invalid JSON escape \'
+    #    (Turn it into a normal apostrophe) and try again.
+    try:
+        fixed = s.replace("\\'", "'")
+        obj = json.loads(fixed)
+        return obj["Analysis"]
+    except Exception as e:
+        raise ValueError(f'Could not extract "Analysis": {e}')
+
+if __name__ == "__main__":
+    text = '{\n  "Analysis": "To answer the user\'s query about the parking cost options near Shoppers Drug Mart, I reviewed the provided knowledge graph information and event-to-event connections. However, the video frames and knowledge graph information do not contain explicit details about parking costs at Shoppers Drug Mart. The events and objects described in the knowledge graph and video frames provide a rich description of the urban environment, including scenes with a \'Shoppers Drug Mart\' sign and various parking lots. However, none of these scenes directly mention parking costs or provide a clear indication of the parking rates at the specific location near Shoppers Drug Mart.\n\nThe event-to-event connections provided some context about the urban environment, including the presence of parking lots and the presence of \'Shoppers Drug Mart\' in different scenes. However, none of these connections directly address the parking costs. \n\nOne event, Event-47edb4b460b4bae657d948df31fbdb18, does mention a flat-rate parking cost of $10 in a snowy urban environment. While this event does not directly reference Shoppers Drug Mart, it provides a possible parking cost scenario that could be relevant to the user\'s query. The user is asking for specific parking cost information, and while the video frames and knowledge graph provide a detailed urban environment, they do not contain the exact information requested.\n\nTherefore, based on the available information, I cannot provide a definitive answer to the user\'s query about parking cost options near Shoppers Drug Mart. The user may need to provide more specific information about the location or seek additional sources for the parking cost details."\n}'
+    print(extract_analysis_value(text))

@@ -158,6 +158,8 @@ database_og/
 # Project specific
 *.log
 *.json
+**/*.txt
+**/*.csv
 !requirements.txt
 !package.json
 

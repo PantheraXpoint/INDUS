@@ -444,6 +444,17 @@ class NetworkXStorage(BaseGraphStorage):
         return None
 
     @staticmethod
+    def load_nx_graph_from_dir(working_dir: str, namespace: str):
+        """Try graph_{namespace}.graphml then graph_{namespace}.graphml.xml. Returns (graph, path_used) or (None, None)."""
+        base = os.path.join(working_dir, f"graph_{namespace}.graphml")
+        for path in [base, base + ".xml"]:
+            if os.path.exists(path):
+                g = NetworkXStorage.load_nx_graph(path)
+                if g is not None:
+                    return g, path
+        return None, None
+
+    @staticmethod
     def write_nx_graph(graph: nx.Graph, file_name):
         logger.info(
             f"Writing graph with {graph.number_of_nodes()} nodes, {graph.number_of_edges()} edges"
@@ -499,10 +510,9 @@ class NetworkXStorage(BaseGraphStorage):
         return fixed_graph
 
     def __post_init__(self):
-        self._graphml_xml_file = os.path.join(
-            self.global_config["working_dir"], f"graph_{self.namespace}.graphml"
-        )
-        preloaded_graph = NetworkXStorage.load_nx_graph(self._graphml_xml_file)
+        working_dir = self.global_config["working_dir"]
+        preloaded_graph, path_used = NetworkXStorage.load_nx_graph_from_dir(working_dir, self.namespace)
+        self._graphml_xml_file = path_used or os.path.join(working_dir, f"graph_{self.namespace}.graphml")
         if preloaded_graph is not None:
             logger.info(
                 f"Loaded graph from {self._graphml_xml_file} with {preloaded_graph.number_of_nodes()} nodes, {preloaded_graph.number_of_edges()} edges"
