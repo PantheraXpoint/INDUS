@@ -52,6 +52,7 @@ A typical layout is:
 ├── embeddings/
 ├── llms/
 └── figures/
+```
 
 ## Run retrieval
 
