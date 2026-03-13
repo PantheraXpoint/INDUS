@@ -109,4 +109,3 @@ python ECML-PKDD/calc_retrieval_accuracy.py \
 * Cache cluster gap: `30.0`
 * GPU: single RTX 3090
 
-```
