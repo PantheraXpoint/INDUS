@@ -204,7 +204,7 @@ Please list all objects, entities, places, shops, landmarks, or things mentioned
 Objects to search for:"""
         
         try:
-            llm_response = llm.generate_response({"text": prompt}, max_new_tokens=256, temperature=0.3)
+            llm_response = llm.batch_generate_response([{"text": prompt}], max_new_tokens=256, temperature=0.3)[0]
             # Parse the response to extract objects
             # Split by newlines and commas, clean up
             query_objects = []

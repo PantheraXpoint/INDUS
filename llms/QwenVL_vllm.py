@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from llms.BaseModel import BaseVideoModel
 from lmdeploy.vl.utils import encode_image_base64
+from lmdeploy import GenerationConfig
 from openai import OpenAI
 
 
@@ -52,7 +53,33 @@ class QwenVL_vllm(BaseVideoModel):
                     totals[k] += v
         return totals
 
-    async def _async_request(self, session_input, temperature: float, max_tokens: int):
+    async def _async_request(
+        self,
+        session_input,
+        temperature: float,
+        max_tokens: int,
+        gen_config: Optional[GenerationConfig] = None,
+    ):
+        """
+        Internal helper to perform a single OpenAI-compatible chat completion request.
+
+        If a lmdeploy.GenerationConfig is provided, its fields override the
+        corresponding scalar arguments where applicable, so that calling code
+        can control decoding in a way similar to QwenLM/QwenVL.
+        """
+        if gen_config is not None:
+            # Map common fields from lmdeploy.GenerationConfig to OpenAI/vLLM params.
+            try:
+                if hasattr(gen_config, "temperature") and gen_config.temperature is not None:
+                    temperature = float(gen_config.temperature)
+            except Exception:
+                pass
+            try:
+                if hasattr(gen_config, "max_new_tokens") and gen_config.max_new_tokens is not None:
+                    max_tokens = int(gen_config.max_new_tokens)
+            except Exception:
+                pass
+
         return await asyncio.to_thread(
             self.client.chat.completions.create,
             model=self.model_type,
@@ -69,6 +96,7 @@ class QwenVL_vllm(BaseVideoModel):
         temperature: float = 0.5,
         log_usage: bool = True,
         return_usage: bool = False,
+        gen_config: Optional[GenerationConfig] = None,
     ) -> Union[List[str], Tuple[List[str], List[Optional[Dict[str, Any]]], Dict[str, int]]]:
         """
         If return_usage=True, returns:
@@ -93,7 +121,14 @@ class QwenVL_vllm(BaseVideoModel):
                     content = [{"type": "text", "text": inputs["text"]}]
 
                 messages = [{"role": "user", "content": content}]
-                tasks.append(self._async_request(messages, temperature=temperature, max_tokens=max_new_tokens))
+                tasks.append(
+                    self._async_request(
+                        messages,
+                        temperature=temperature,
+                        max_tokens=max_new_tokens,
+                        gen_config=gen_config,
+                    )
+                )
 
             # Don't crash the whole batch if one request fails
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -106,7 +141,10 @@ class QwenVL_vllm(BaseVideoModel):
                     texts.append(f"[ERROR] {type(r).__name__}: {r}")
                     usages.append(None)
                     if log_usage:
-                        print(f"[usage {i}] ERROR (no usage)")
+                        print(
+                            f"[usage {i}] ERROR (no usage): {r}",
+                            file=__import__("sys").stderr,
+                        )
                     continue
 
                 # normal response
@@ -121,7 +159,11 @@ class QwenVL_vllm(BaseVideoModel):
                     if u is None:
                         print(f"[usage {i}] None (server did not return usage)")
                     else:
-                        print(f"[usage {i}] prompt={u.get('prompt_tokens')} completion={u.get('completion_tokens')} total={u.get('total_tokens')}")
+                        print(
+                            f"[usage {i}] prompt={u.get('prompt_tokens')} "
+                            f"completion={u.get('completion_tokens')} "
+                            f"total={u.get('total_tokens')}"
+                        )
 
             totals = self._sum_usages(usages)
             if log_usage:

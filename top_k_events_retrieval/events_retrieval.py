@@ -153,15 +153,28 @@ def main():
 
     for idx, (video_key, question_id, question, options_str) in enumerate(queries):
         kg_dir = kg_mapping.get(video_key)
-        question_with_options = f"{question}\n{options_str}".strip() if options_str else question
+
+        # For LVBench, the original data may contain both question and options
+        # in a single string field. Split on the first '?' to separate them.
+        question_for_query = (question or "").strip()
+        options_for_output = options_str
+        if args.dataset == "LVBench":
+            combined = (question or "").strip()
+            if "?" in combined:
+                q_part, rest = combined.split("?", 1)
+                question_for_query = (q_part + "?").strip()
+                options_for_output = rest.strip()
+            else:
+                question_for_query = combined
+                options_for_output = (options_str or "").strip()
 
         if not kg_dir:
             results.append({
                 "dataset": args.dataset,
                 "video_key": video_key,
                 "question_id": question_id,
-                "question": question,
-                "options": options_str,
+                "question": question_for_query,
+                "options": options_for_output,
                 "skip_reason": "no_kg",
                 "seed_event_ids": [],
                 "seed_events": [],
@@ -170,12 +183,10 @@ def main():
             continue
 
         try:
-            # Time: load VDB + LLM call + embedding + retrieve + result assembly (exclude file writes)
+            # Time: load VDB + embedding + retrieve + result assembly (exclude file writes)
             t0 = time.perf_counter()
             events_vdb = _load_events_vdb(kg_dir, embedding_model, embedding_dim)
-            prompt = PROMPTS["keyword_extraction"].format(input_text=question_with_options)
-            keyword_str = llm.batch_generate_response([{"text": prompt}])[0]
-            keyword_str = (keyword_str or "").strip()
+            keyword_str = question_for_query
             event_results = events_vdb.query(keyword_str, top_k=args.top_k)
             seed_event_ids = [e["id"] for e in event_results if e.get("id")]
             seed_events = []
@@ -201,8 +212,8 @@ def main():
             "dataset": args.dataset,
             "video_key": video_key,
             "question_id": question_id,
-            "question": question,
-            "options": options_str,
+            "question": question_for_query,
+            "options": options_for_output,
             "localization_time_seconds": None,
             "llm_outputs": {"keyword_extraction": keyword_str if kg_dir else ""},
             "seed_event_ids": seed_event_ids,

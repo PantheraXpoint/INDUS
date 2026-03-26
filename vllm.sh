@@ -12,9 +12,9 @@
 #   --enforce-eager \
 #   --trust-remote-code
 lmdeploy serve api_server \
-  Qwen/Qwen2.5-14B-Instruct-AWQ \
+  Qwen/Qwen2.5-VL-7B-Instruct-AWQ \
   --model-format awq \
   --backend turbomind \
   --tp 1 \
-  --session-len 32768 \
-  --server-port 8000 
+  --session-len 110000 \
+  --server-port $PORT

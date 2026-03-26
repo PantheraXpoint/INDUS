@@ -44,6 +44,7 @@ import sys
 import json
 import re
 import argparse
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -606,7 +607,7 @@ def run_method_b(
     time_fb_used = 0.0
 
     if remaining_seeds:
-        boundary_ids = boundary_ids_global(events_vdb, remaining_seeds)
+        boundary_ids = set(remaining_seeds)
         trace["boundary_ids"] = list(boundary_ids)
 
         fb_selective = (fb_mode == "selective")
@@ -666,7 +667,7 @@ def main():
     # VLM for Method A
     p.add_argument("--use-vlm", action="store_true")
     p.add_argument("--llm-port", type=int, default=8000)
-    p.add_argument("--llm-model", type=str, default="Qwen/Qwen2.5-14B-Instruct-AWQ")
+    p.add_argument("--llm-model", type=str, default="Qwen/Qwen2.5-VL-7B-Instruct-AWQ")
     p.add_argument("--verify-rule", choices=["any", "majority", "all"], default="any")
 
     # Cache
@@ -678,16 +679,19 @@ def main():
                    choices=["final", "A", "B", "all"],
                    default="final",
                    help="What to save into cache: final only (default), A only, B only, or all three.")
+    p.add_argument("--method_a_mode", action="store_true", help="Use Method A mode.")
+    p.add_argument("--method_b_mode", action="store_true", help="Use Method B mode.")
 
     args = p.parse_args()
     dataset = args.dataset
 
     retrieval_dir = _ecml_dir / f"{dataset.lower()}_retrieval"
     seed_path = retrieval_dir / f"seed_events_{dataset}.json"
+    seed_path = Path(f"/home/panthera/avas/Project-Ava/top_k_events_retrieval/seed_events_{dataset}_k70.json")
     if not seed_path.exists():
         raise FileNotFoundError(f"Seed file not found: {seed_path}")
 
-    seed_data = json.loads(seed_path.read_text())
+    seed_data = json.loads(seed_path.read_text())["results"]
     if not isinstance(seed_data, list):
         raise ValueError(f"Expected list in {seed_path}, got {type(seed_data)}")
 
@@ -700,6 +704,16 @@ def main():
         print(f"[Cache] Enabled: {cache_path}")
     else:
         print("[Cache] Disabled")
+    
+    vlm = None
+    if args.use_vlm:
+        if indus_prompts is None:
+            raise RuntimeError("indus_prompts not available; cannot use --use-vlm")
+        from llms.init_model import init_model
+        vlm = init_model("qwenvl_vllm", num_gpus=1, model_type=args.llm_model, port=args.llm_port)
+        print(f"VLM enabled (port={args.llm_port}, model={args.llm_model}), verify_rule={args.verify_rule}")
+    else:
+        print("No-VLM mode for Method A.")
 
     # GT/questions for Method B
     gt = load_gt()
@@ -710,18 +724,9 @@ def main():
         questions = load_questions()
         from expansion_od.grounding import GroundingDetector
         grounding_detector = GroundingDetector()
-        llm_for_grounding = QwenLM()
+        llm_for_grounding = vlm
 
     # Optional VLM for Method A
-    vlm = None
-    if args.use_vlm:
-        if indus_prompts is None:
-            raise RuntimeError("indus_prompts not available; cannot use --use-vlm")
-        from llms.init_model import init_model
-        vlm = init_model("qwenvl_vllm", num_gpus=1, model_type=args.llm_model, port=args.llm_port)
-        print(f"VLM enabled (port={args.llm_port}, model={args.llm_model}), verify_rule={args.verify_rule}")
-    else:
-        print("No-VLM mode for Method A.")
 
     # embedding model + vdb cache per video
     from embeddings.JinaCLIP import JinaCLIP
@@ -741,6 +746,7 @@ def main():
             continue
 
         print(f"[{idx+1}/{len(seed_data)}] video={vk} qid={qid}")
+        start_time = time.time()
 
         # init VDB per video
         if vk != current_vk:
@@ -770,46 +776,61 @@ def main():
         topk_seed_ids = [x for x in topk_seed_ids if x in valid_event_ids]
 
         # Method A (with cache reuse)
-        out_A, trace_A, cache_meta_A, time_A = run_method_a(
-            entry=entry,
-            events_vdb=events_vdb,
-            valid_event_ids=valid_event_ids,
-            topk_seed_ids=topk_seed_ids,
-            budget=args.budget,
-            use_vlm=args.use_vlm,
-            vlm=vlm,
-            verify_rule=args.verify_rule,
-            cache_video_clusters=cache_video_clusters,
-            cache_overlap_threshold=args.cache_overlap_threshold,
-            cache_cluster_gap=args.cache_cluster_gap,
-        )
+        if args.method_a_mode:
+            out_A, trace_A, cache_meta_A, time_A = run_method_a(
+                entry=entry,
+                events_vdb=events_vdb,
+                valid_event_ids=valid_event_ids,
+                topk_seed_ids=topk_seed_ids,
+                budget=args.budget,
+                use_vlm=args.use_vlm,
+                vlm=vlm,
+                verify_rule=args.verify_rule,
+                cache_video_clusters=cache_video_clusters,
+                cache_overlap_threshold=args.cache_overlap_threshold,
+                cache_cluster_gap=args.cache_cluster_gap,
+            )
+        else:
+            out_A = set()
+            trace_A = {}
+            cache_meta_A = {}
+            time_A = 0.0
 
         # Method B (with cache reuse)
-        out_B, trace_B, cache_meta_B, time_B = run_method_b(
-            entry=entry,
-            vk=str(vk),
-            qid=qid,
-            dataset=dataset,
-            events_vdb=events_vdb,
-            entities_vdb=entities_vdb,
-            valid_event_ids=valid_event_ids,
-            topk_seed_ids=topk_seed_ids,
-            fb_mode=args.fb_mode,
-            gt=gt,
-            questions=questions,
-            grounding_detector=grounding_detector,
-            grounding_threshold=args.grounding_threshold,
-            llm_for_grounding=llm_for_grounding,
-            cache_video_clusters=cache_video_clusters,
-            cache_overlap_threshold=args.cache_overlap_threshold,
-            cache_cluster_gap=args.cache_cluster_gap,
-        )
+        if args.method_b_mode:
+            out_B, trace_B, cache_meta_B, time_B = run_method_b(
+                entry=entry,
+                vk=str(vk),
+                qid=qid,
+                dataset=dataset,
+                events_vdb=events_vdb,
+                entities_vdb=entities_vdb,
+                valid_event_ids=valid_event_ids,
+                topk_seed_ids=topk_seed_ids,
+                fb_mode=args.fb_mode,
+                gt=gt,
+                questions=questions,
+                grounding_detector=grounding_detector,
+                grounding_threshold=args.grounding_threshold,
+                llm_for_grounding=llm_for_grounding,
+                cache_video_clusters=cache_video_clusters,
+                cache_overlap_threshold=args.cache_overlap_threshold,
+                cache_cluster_gap=args.cache_cluster_gap,
+            )
+        else:
+            out_B = set()
+            trace_B = {}
+            cache_meta_B = {}
+            time_B = 0.0
+        
 
         # Merge
         if args.merge_mode == "intersection":
             final_ids = (out_A & out_B) & valid_event_ids
         else:
             final_ids = (out_A | out_B) & valid_event_ids
+        if not args.method_a_mode and not args.method_b_mode:
+            final_ids = set(topk_seed_ids)
 
         # Save to cache (shared pool) after handling everything
         clusters_saved = 0
@@ -828,7 +849,9 @@ def main():
                 )
 
         final_events = fetch_event_data(final_ids, events_vdb)
-
+        end_time = time.time()
+        print(f"Time taken: {end_time - start_time} seconds")
+        print(len(out_B))
         out_entries.append({
             "dataset": dataset,
             "video_key": vk,
@@ -868,7 +891,11 @@ def main():
     # Save output json
     out_dir = retrieval_dir / "indus_explore"
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"seed_events_{dataset}_merged_final_{args.merge_mode}_{args.fb_mode}_sharedcache_timeiou.json"
+    if not args.method_a_mode and not args.method_b_mode:
+        out_path = out_dir / f"seed_events_{dataset}_merged_final_{args.merge_mode}_{args.fb_mode}_topk_seeds_sharedcache_timeiou.json"
+    else:
+        out_path = out_dir / f"seed_events_{dataset}_merged_final_{args.merge_mode}_{args.fb_mode}{'_A' if args.method_a_mode else ''}{'_B' if args.method_b_mode else ''}_sharedcache_timeiou.json"
+    out_path = out_dir / f"seed_events_vgent_3.json"
     out_path.write_text(json.dumps(_jsonify(out_entries), indent=2, ensure_ascii=False))
     print(f"\n✓ Saved merged output: {out_path} ({len(out_entries)} entries)")
 

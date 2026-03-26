@@ -36,6 +36,11 @@ from typing import List, Tuple, Optional, Dict, Any
 # Time parsing and overlap (aligned with your existing logic)
 # -----------------------------------------------------------------------------
 
+def f1_score(precision: float, recall: float) -> float:
+    if precision + recall <= 0:
+        return 0.0
+    return 2.0 * precision * recall / (precision + recall)
+
 def time_to_seconds(time_str: str) -> int:
     time_str = (time_str or "").strip()
     if not time_str:
@@ -280,8 +285,9 @@ def load_ground_truth_cache(dataset: str, project_root: Path) -> Dict[Tuple[str,
                         video_key = video.get("key") or video.get("video_key")
                         if not video_key:
                             continue
-                        for qa in video.get("qa", []):
+                        for idx, qa in enumerate(video.get("qa", [])):
                             uid = qa.get("uid") or qa.get("question_id")
+                            uid = str(idx)
                             if uid is not None:
                                 cache[(video_key, str(uid))] = qa.get("time_reference", "N/A")
             except Exception as e:
@@ -391,6 +397,8 @@ def run_accuracy(seed_events_path, dataset: str, project_root: Path, output_path
     elif isinstance(seed_events_path, list):
         for entry in seed_events_path:
             data_entries = json.loads(entry.read_text())
+            if isinstance(data_entries, dict):
+                data_entries = data_entries.get("results", [])
             for idx, data_entry in enumerate(data_entries):
                 if (
                     len(data) > idx
@@ -421,6 +429,13 @@ def run_accuracy(seed_events_path, dataset: str, project_root: Path, output_path
     sum_precision_sec = 0.0
     sum_iou_sec = 0.0
     sum_snr_sec = 0.0
+    num_reuse_events_sum_all = 0
+
+    sum_recall_evt = 0.0
+    sum_f1_evt = 0.0
+
+    sum_recall_sec = 0.0
+    sum_f1_sec = 0.0
 
     for entry in data:
         video_key = entry.get("video_key")
@@ -431,6 +446,7 @@ def run_accuracy(seed_events_path, dataset: str, project_root: Path, output_path
         seed_events = entry.get("seed_events") or []
         events_sec = event_durations_to_seconds(seed_events, dataset, video_key)
         intervals = [tuple(ev["interval_sec"]) for ev in events_sec]
+        num_reuse_events_sum_all += (entry.get("cache_meta", {}).get("A", {}).get("reused_events", 0)) + (entry.get("cache_meta", {}).get("B", {}).get("reused_events", 0))
 
         total_duration_sec = sum(e - s for s, e in intervals)
         num_events = len(intervals)
@@ -479,6 +495,9 @@ def run_accuracy(seed_events_path, dataset: str, project_root: Path, output_path
                 fn_seg += 1
         denom_evt_iou = tp_seg + fn_seg + fp_evt
         iou_evt = (tp_seg / denom_evt_iou) if denom_evt_iou > 0 else 0.0
+        
+        recall_evt = (tp_seg / (tp_seg + fn_seg)) if (tp_seg + fn_seg) > 0 else 0.0
+        f1_evt = f1_score(precision_evt, recall_evt)
 
         # ----------------------------
         # Sec-level metrics
@@ -492,6 +511,9 @@ def run_accuracy(seed_events_path, dataset: str, project_root: Path, output_path
         iou_sec = (I / U) if U > 0 else 0.0
         noise = (R - I)
         snr_sec = float("inf") if (noise == 0 and I > 0) else (I / noise if noise > 0 else 0.0)
+
+        recall_sec = (I / G) if G > 0 else 0.0
+        f1_sec = f1_score(precision_sec, recall_sec)
 
         # store per-query hit list (events that hit any GT segment)
         events_hit = [ev for ev in events_sec if event_hits_any_gt_segment(tuple(ev["interval_sec"]), gt_segments)]
@@ -517,6 +539,9 @@ def run_accuracy(seed_events_path, dataset: str, project_root: Path, output_path
             "precision_evt": precision_evt,
             "iou_evt": iou_evt,
             "snr_evt": snr_evt,
+            "recall_evt": recall_evt,
+            "f1_evt": f1_evt,
+
 
             # sec-level
             "retrieved_sec_union": R,
@@ -525,10 +550,14 @@ def run_accuracy(seed_events_path, dataset: str, project_root: Path, output_path
             "precision_sec": precision_sec,
             "iou_sec": iou_sec,
             "snr_sec": snr_sec,
+            "recall_sec": recall_sec,
+            "f1_sec": f1_sec,
         })
 
         sum_precision_evt += precision_evt
         sum_iou_evt += iou_evt
+        sum_recall_evt += recall_evt
+        sum_f1_evt += f1_evt
         # average SNR: treat inf as a large cap? We'll keep numeric sum ignoring inf, and separately count inf.
         # For simplicity: if inf, don't add to sum and count separately.
         if snr_evt != float("inf"):
@@ -536,6 +565,8 @@ def run_accuracy(seed_events_path, dataset: str, project_root: Path, output_path
 
         sum_precision_sec += precision_sec
         sum_iou_sec += iou_sec
+        sum_recall_sec += recall_sec
+        sum_f1_sec += f1_sec
         if snr_sec != float("inf"):
             sum_snr_sec += snr_sec
 
@@ -549,6 +580,7 @@ def run_accuracy(seed_events_path, dataset: str, project_root: Path, output_path
             "coverage_rate": None,
             "avg_total_event_duration_sec": total_duration_sum_all / n_total if n_total else None,
             "avg_num_events": num_events_sum_all / n_total if n_total else None,
+            "cache_hit_rate": num_reuse_events_sum_all/ num_events_sum_all,
             "per_query": [],
         }
         if output_path:
@@ -580,6 +612,8 @@ def run_accuracy(seed_events_path, dataset: str, project_root: Path, output_path
         "iou_evt": sum_iou_evt / n_valid,
         "snr_evt_avg_finite": (sum_snr_evt / finite_n_evt) if finite_n_evt > 0 else None,
         "snr_evt_inf_count": inf_snr_evt,
+        "recall_evt": sum_recall_evt / n_valid,
+        "f1_evt": sum_f1_evt / n_valid,
 
         "precision_sec": sum_precision_sec / n_valid,
         "iou_sec": sum_iou_sec / n_valid,
@@ -591,6 +625,9 @@ def run_accuracy(seed_events_path, dataset: str, project_root: Path, output_path
         "percentage_sum": percentage_sum,
         "avg_total_event_duration_sec": total_duration_sum_all / n_total if n_total else None,
         "avg_num_events": num_events_sum_all / n_total if n_total else None,
+        "cache_hit_rate": num_reuse_events_sum_all/ num_events_sum_all,
+        "recall_sec": sum_recall_sec / n_valid,
+        "f1_sec": sum_f1_sec / n_valid,
 
         "per_query": per_query,
     }
@@ -635,11 +672,15 @@ def main():
 
         print("\nEvent-level:")
         print(f"  Precision(evt): {result['precision_evt']:.4f}")
+        print(f"  Recall(evt):    {result['recall_evt']:.4f}")
+        print(f"  F1(evt):        {result['f1_evt']:.4f}")
         print(f"  IoU(evt):       {result['iou_evt']:.4f}")
         print(f"  SNR(evt):       {result['snr_evt_avg_finite']:.4f} (finite avg), inf_count={result['snr_evt_inf_count']}")
 
         print("\nSecond-level:")
         print(f"  Precision(sec): {result['precision_sec']:.4f}")
+        print(f"  Recall(sec):    {result['recall_sec']:.4f}")
+        print(f"  F1(sec):        {result['f1_sec']:.4f}")
         print(f"  IoU(sec):       {result['iou_sec']:.4f}")
         print(f"  SNR(sec):       {result['snr_sec_avg_finite']:.4f} (finite avg), inf_count={result['snr_sec_inf_count']}")
 
@@ -647,6 +688,7 @@ def main():
         print(f"\nAvg total event duration: {result['avg_total_event_duration_sec']:.2f} sec per query (over all {n_total} queries)")
         print(f"Avg num events per query: {result['avg_num_events']:.2f} (over all {n_total} queries)")
 
+    print(f"Cache hit rate: {result['cache_hit_rate']:.4f}")
     if args.output:
         print(f"\nWrote full result to {args.output}")
 

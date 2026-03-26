@@ -89,7 +89,7 @@ Please list all objects, entities, places, shops, landmarks, or things mentioned
 
 Objects to search for:"""
     
-    llm_response = llm.generate_response({"text": prompt}, max_new_tokens=256, temperature=0.3)
+    llm_response = llm.batch_generate_response([{"text": prompt}], max_new_tokens=256, temperature=0.3)[0]
     # Parse the response to extract objects
     # Split by newlines and commas, clean up
     query_objects = []
@@ -165,6 +165,12 @@ def prepare_question_data(question_id, video_info, llm, detector,
         if event["video_key"] == video_key and event["question_id"] == question_id:
             event_results.extend(event["seed_events"])
             break
+    if event_results == []:
+        event_same_video_key = [event for event in all_event_results if event["video_key"] == video_key]
+        for idx, event in enumerate(event_same_video_key):
+            if idx == question_id:
+                event_results.extend(event["seed_events"])
+                break
     if event_results == []:
         print(f"No event results found for video {video_info['video_key']} question {question_id}")
         return None, None
@@ -362,7 +368,7 @@ def process_question(questions_to_process):
                 single_input = {"text": prompt}
 
             vlm_call_start = time.time()
-            response = vlm.generate_response(single_input)
+            response = vlm.batch_generate_response([single_input])[0]
             log_timing(profiler_logger, f"Video {video_id} Q{question_id} VLM Call", vlm_call_start)
 
             if extract_predicted_answer(response) is None:
@@ -381,6 +387,7 @@ def process_question(questions_to_process):
                 "method": "vlm_direct"
             }
             results.append(result)
+            print("Time taken for all: ", time.time() - prep_start)
 
             if not safe_write_json(json_file, results):
                 profiler_logger.error(f"Failed to save results for video {video_id} Q{question_id}")

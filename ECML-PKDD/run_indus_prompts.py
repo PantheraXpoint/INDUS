@@ -21,6 +21,7 @@ import shutil
 import argparse
 from pathlib import Path
 from typing import List, Optional, Tuple
+import time
 
 project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root))
@@ -174,6 +175,7 @@ def run_phase1(dataset: str, port: int, model: str):
     llm = init_model("qwenvl_vllm", num_gpus=1, model_type=model, port=port)
     results = {k: [] for k in PHASE1_PROMPT_KEYS}
     for idx, (video_key, question_id, question, options_str) in enumerate(rows):
+        start_time = time.time()
         print(f"[{idx + 1}/{total}] {dataset} video={video_key} question_id={question_id}")
         entry_meta = {"dataset": dataset, "video_key": video_key, "question_id": question_id, "question": question, "options": options_str}
         for key in PHASE1_PROMPT_KEYS:
@@ -185,9 +187,11 @@ def run_phase1(dataset: str, port: int, model: str):
             prompt = indus_prompts.INDUS_PROMPT[prompt_key].format(question=question, options=options_str)
             out = llm.batch_generate_response([{"text": prompt}])[0]
             results[key].append({**entry_meta, "llm_output": out})
+        end_time = time.time()
+        print(f"Time taken for {dataset} video={video_key} question_id={question_id}: {end_time - start_time:.2f} seconds")
     for key in PHASE1_PROMPT_KEYS:
         out_path = OUTPUT_DIR / f"{key}_{dataset}.json"
-        out_path.write_text(json.dumps(results[key], indent=2))
+        # out_path.write_text(json.dumps(results[key], indent=2))
         print(f"Wrote {out_path} ({len(results[key])} entries)")
     print(f"Phase 1 done. Processed {total} queries for {dataset}.")
 
@@ -935,10 +939,10 @@ def run_phase2(dataset: str, port: int, model: str, vlm_port: Optional[int] = No
         temporal_retrieval_log.append(log_entry)
 
     out_path = OUTPUT_DIR / f"seed_events_{dataset}.json"
-    out_path.write_text(json.dumps(results, indent=2))
+    # out_path.write_text(json.dumps(results, indent=2))
     print(f"Wrote {out_path} ({len(results)} entries)")
     log_path = OUTPUT_DIR / f"temporal_retrieval_log_{dataset}.json"
-    log_path.write_text(json.dumps(temporal_retrieval_log, indent=2))
+    # log_path.write_text(json.dumps(temporal_retrieval_log, indent=2))
     print(f"Wrote {log_path} ({len(temporal_retrieval_log)} entries)")
     if dataset == "AVA100" and FRAMES_CHECK_DIR.exists():
         n_frames = len(list(FRAMES_CHECK_DIR.glob("*.jpg")))
